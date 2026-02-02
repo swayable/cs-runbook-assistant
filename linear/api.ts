@@ -131,6 +131,10 @@ export async function createLinearTicket(params: {
   if (labelId) input.labelIds = [labelId];
 
   const data = await linearGraphQL(m, { input }) as { issueCreate: { issue: { url: string; identifier: string } } };
+
+  // Clear the recent issues cache since we just created a new ticket
+  clearRecentIssuesCache();
+
   return {
     url: data.issueCreate.issue.url,
     identifier: data.issueCreate.issue.identifier,
@@ -157,12 +161,32 @@ export async function searchLinearIssues(term: string, teamId: string): Promise<
 // Last 7 Days Issues Fetch (no state filtering)
 // ============================================================================
 
+// Cache for recent issues to reduce API calls
+const RECENT_ISSUES_CACHE = new Map<string, { issues: LinearIssue[]; ts: number }>();
+const RECENT_ISSUES_CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes
+
+/**
+ * Clear the recent issues cache. Called after ticket creation.
+ */
+export function clearRecentIssuesCache(): void {
+  RECENT_ISSUES_CACHE.clear();
+}
+
 /**
  * Fetch recently-updated issues for a team.
  * Uses updatedAt filter (not createdAt) to catch active tickets regardless of creation date.
  * Does NOT filter by state - returns all issues regardless of status.
+ *
+ * Results are cached for 5 minutes to reduce API load on repeated queries.
  */
 export async function fetchRecentIssues(teamId: string, daysBack = 7, maxIssues = 100): Promise<LinearIssue[]> {
+  // Check cache first
+  const cacheKey = `${teamId}:${daysBack}:${maxIssues}`;
+  const cached = RECENT_ISSUES_CACHE.get(cacheKey);
+  if (cached && Date.now() - cached.ts < RECENT_ISSUES_CACHE_TTL_MS) {
+    console.log(`[fetchRecentIssues] Cache hit for teamId=${teamId}`);
+    return cached.issues;
+  }
   const since = new Date();
   since.setDate(since.getDate() - daysBack);
   const sinceISO = since.toISOString();
@@ -197,6 +221,11 @@ export async function fetchRecentIssues(teamId: string, daysBack = 7, maxIssues 
     }) as { team: { issues: { nodes: LinearIssue[] } } };
     const issues = data.team?.issues?.nodes || [];
     console.log(`[fetchRecentIssues] teamId=${teamId}, since=${sinceISO}, found ${issues.length} issues`);
+
+    // Cache the results
+    const cacheKey = `${teamId}:${daysBack}:${maxIssues}`;
+    RECENT_ISSUES_CACHE.set(cacheKey, { issues, ts: Date.now() });
+
     return issues;
   } catch (e) {
     console.warn("[fetchRecentIssues] Failed:", String((e as any)?.message || e));

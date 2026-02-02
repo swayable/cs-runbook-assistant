@@ -1,14 +1,14 @@
 // retrieval/rank.ts — Scoring and ranking
 
 import type { Chunk, Ranked, ChunkWithEmbedding } from "../types/index.ts";
-import { normalizeQuery, tokenize, uniq } from "../util/text.ts";
+import { normalizeQuery, normalizeSearchQuery, tokenize, uniq } from "../util/text.ts";
 import { cosineSimilarity, embedText } from "./embeddings.ts";
 import { HYBRID_SEARCH_ENABLED } from "../env.ts";
 
 // Hybrid search weights
 const KEYWORD_WEIGHT = 0.4;
 const EMBEDDING_WEIGHT = 0.6;
-const HYBRID_THRESHOLD = 0.15;
+const HYBRID_THRESHOLD = 0.20;
 
 // Query embedding cache (reduces API calls for repeated queries)
 const QUERY_EMBED_CACHE = new Map<string, { vec: number[]; ts: number }>();
@@ -16,7 +16,7 @@ const QUERY_CACHE_TTL_MS = 15 * 60 * 1000; // 15 minutes
 const QUERY_CACHE_MAX_SIZE = 100;
 
 export function score(queryRaw: string, chunk: Chunk): number {
-  const q = normalizeQuery(queryRaw);
+  const q = normalizeSearchQuery(queryRaw);
   const hay = (chunk.pageTitle + "\n" + chunk.sectionTitle + "\n" + chunk.text)
     .toLowerCase();
   const terms = uniq(tokenize(q));
@@ -72,9 +72,12 @@ export function isEngineeringOnly(chunks: Chunk[]): boolean {
 
 /**
  * Get query embedding with caching to reduce API calls.
+ * Uses normalizeSearchQuery for consistent cache keys with keyword scoring.
  */
 export async function embedQueryCached(query: string): Promise<number[]> {
-  const key = query.toLowerCase().trim();
+  // Use normalizeSearchQuery for consistent normalization with keyword scoring
+  const normalizedQuery = normalizeSearchQuery(query);
+  const key = normalizedQuery;
 
   // Check cache
   const cached = QUERY_EMBED_CACHE.get(key);
@@ -82,8 +85,8 @@ export async function embedQueryCached(query: string): Promise<number[]> {
     return cached.vec;
   }
 
-  // Generate new embedding
-  const vec = await embedText(query);
+  // Generate new embedding using normalized query
+  const vec = await embedText(normalizedQuery);
 
   // Evict oldest if over limit
   if (QUERY_EMBED_CACHE.size >= QUERY_CACHE_MAX_SIZE) {

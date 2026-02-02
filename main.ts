@@ -328,7 +328,7 @@ async function director(question: string): Promise<{ route: RouteDecision; direc
 // Main Orchestration: handleQuestion
 // ============================================================================
 
-const RELEVANCE_SCORE_THRESHOLD = 0.15;
+const RELEVANCE_SCORE_THRESHOLD = 0.20;
 
 /**
  * Unified question handler used by both web and Slack endpoints.

@@ -4,7 +4,7 @@
 
 import { NOTION_TOKEN, NOTION_ROOT_PAGE_ID } from "../env.ts";
 import type { Chunk, Ranked } from "../types/index.ts";
-import { normalizeQuery, tokenize, uniq, extractLinearRefs } from "../util/text.ts";
+import { normalizeQuery, normalizeSearchQuery, tokenize, uniq, extractLinearRefs } from "../util/text.ts";
 
 // ============================================================================
 // Types
@@ -197,7 +197,7 @@ function codeSignalsCount(text: string): number {
  * Score a chunk against a query using keyword matching.
  */
 function keywordScore(queryRaw: string, pageTitle: string, sectionTitle: string, text: string): number {
-  const q = normalizeQuery(queryRaw);
+  const q = normalizeSearchQuery(queryRaw);
   const hay = (pageTitle + "\n" + sectionTitle + "\n" + text).toLowerCase();
   const terms = uniq(tokenize(q));
 

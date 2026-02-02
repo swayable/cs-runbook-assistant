@@ -1,7 +1,48 @@
 // util/text.ts — Text utilities
 
+/**
+ * Basic query normalization: lowercase, remove quotes, trim.
+ */
 export function normalizeQuery(raw: string): string {
   return raw.toLowerCase().replaceAll('"', "").trim();
+}
+
+/**
+ * CS-specific prefixes to strip from queries for better matching.
+ * These are common ways CS agents phrase customer issues.
+ */
+const CS_PREFIXES = [
+  /^customer\s+says?\s+/i,
+  /^customer\s+reports?\s+/i,
+  /^user\s+says?\s+/i,
+  /^user\s+reports?\s+/i,
+  /^client\s+says?\s+/i,
+  /^they\s+say\s+/i,
+  /^they\s+report\s+/i,
+  /^the\s+customer\s+/i,
+  /^a\s+customer\s+/i,
+  /^getting\s+reports\s+of\s+/i,
+  /^we('re|'ve|\s+are)\s+seeing\s+/i,
+];
+
+/**
+ * Enhanced query normalization for search.
+ * Strips CS-specific prefixes to get to the core issue.
+ *
+ * Example: "customer says export failed" -> "export failed"
+ */
+export function normalizeSearchQuery(raw: string): string {
+  let q = raw.toLowerCase().replaceAll('"', "").trim();
+
+  // Strip CS prefixes
+  for (const prefix of CS_PREFIXES) {
+    q = q.replace(prefix, "");
+  }
+
+  // Collapse whitespace
+  q = q.replace(/\s+/g, " ").trim();
+
+  return q;
 }
 
 export function tokenize(raw: string): string[] {
