@@ -201,7 +201,7 @@ Classify this query.`;
 
     const parsed = safeParseJson<DirectorDecision>(raw);
     if (!isValidDecision(parsed)) {
-      console.warn("Director LLM returned invalid JSON:", raw.slice(0, 200));
+      console.warn(`Director LLM returned invalid JSON (len=${raw.length}):`, raw.slice(0, 500));
       return { decision: null, latencyMs };
     }
 

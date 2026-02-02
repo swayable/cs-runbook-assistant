@@ -55,7 +55,7 @@ export const EMBEDDING_TIMEOUT_MS = Number(Deno.env.get("EMBEDDING_TIMEOUT_MS") 
 export const LLM_DIRECTOR_ENABLED = Deno.env.get("LLM_DIRECTOR_ENABLED") !== "0";
 export const LLM_DIRECTOR_TIMEOUT_MS = Number(Deno.env.get("LLM_DIRECTOR_TIMEOUT_MS") || 8000);
 export const LLM_DIRECTOR_MODEL = Deno.env.get("LLM_DIRECTOR_MODEL") || "claude-3-5-haiku-20241022";
-export const LLM_DIRECTOR_MAX_TOKENS = Number(Deno.env.get("LLM_DIRECTOR_MAX_TOKENS") || 500);
+export const LLM_DIRECTOR_MAX_TOKENS = Number(Deno.env.get("LLM_DIRECTOR_MAX_TOKENS") || 1000);
 export const LLM_DIRECTOR_RETRIES = Number(Deno.env.get("LLM_DIRECTOR_RETRIES") || 3);
 
 // Thread state storage for follow-up conversations
