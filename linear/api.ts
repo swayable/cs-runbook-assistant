@@ -138,7 +138,8 @@ export async function searchLinearIssues(term: string, teamId: string): Promise<
 // ============================================================================
 
 /**
- * Fetch all issues from the last 7 days for a team.
+ * Fetch recently-updated issues for a team.
+ * Uses updatedAt filter (not createdAt) to catch active tickets regardless of creation date.
  * Does NOT filter by state - returns all issues regardless of status.
  */
 export async function fetchRecentIssues(teamId: string, daysBack = 7, maxIssues = 100): Promise<LinearIssue[]> {
@@ -151,8 +152,8 @@ export async function fetchRecentIssues(teamId: string, daysBack = 7, maxIssues 
       team(id: $teamId) {
         issues(
           first: $first,
-          orderBy: createdAt,
-          filter: { createdAt: { gte: $since } }
+          orderBy: updatedAt,
+          filter: { updatedAt: { gte: $since } }
         ) {
           nodes {
             id
