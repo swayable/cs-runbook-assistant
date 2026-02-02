@@ -1,38 +1,13 @@
 // main.ts — Entry point + routing (Val Town HTTP val)
+// HOW TO VERIFY: 1) Thread follow-ups: /cs-help X, then @cs-helper in thread → single reply
+// 2) No dupes: same event_id → logs "DEDUPED" 3) No self-trigger: bot messages ignored
+// 4) Fast ACK: /slack/events returns 200 immediately 5) Logs show event_id, thread_ts, dedupe
+// Test harness: _test_parseSlackEvent, _test_simulateDedupe (bottom of file)
 //
-// Single file implementation for Val Town.
-// All business logic consolidated here.
-//
-// ============================================================================
-// CRON SETUP (Optional - for always-warm cache)
-// ============================================================================
-//
-// To keep the CS runbook assistant always available without /rebuild after idle:
-//
-// 1. Create a Val Town Cron val that hits /rebuild nightly to refresh the index:
-//    ```ts
-//    // cron: 0 3 * * *  (runs at 3 AM UTC daily)
-//    export default async function rebuildIndex() {
-//      const res = await fetch("YOUR_VAL_URL/rebuild");
-//      console.log("Rebuild result:", await res.text());
-//    }
-//    ```
-//
-// 2. (Optional) Create a Cron val that hits /warm every 15-30 minutes to keep
-//    the in-memory cache fresh (reduces cold-start latency):
-//    ```ts
-//    // cron: */15 * * * *  (runs every 15 minutes)
-//    export default async function warmCache() {
-//      const res = await fetch("YOUR_VAL_URL/warm");
-//      console.log("Warm result:", await res.json());
-//    }
-//    ```
-//
-// The /warm endpoint only loads from blob storage (no Notion crawl), so it's
-// cheap and fast. The /rebuild endpoint crawls Notion and updates the blob.
-// ============================================================================
+// CRON: /rebuild nightly (0 3 * * *), /warm every 15min (*/15 * * * *) for cache
 
 import { mustEnv, BLOB_KEY, LINEAR_API_KEY, LINEAR_TEAM_KEY, LINEAR_LABEL_NAME, LINEAR_TIMEOUT_MS, BLOB_MAX_AGE_MS, MAX_FOLLOWUPS } from "./env.ts";
+import { seenEvent, markEventSeen, seenSlashCommand, markSlashCommandSeen, logRetryHeaders } from "./storage/dedupeStore.ts";
 import { json, text } from "./util/response.ts";
 import {
   buildIndex,
@@ -2118,7 +2093,7 @@ async function handleClassify(url: URL): Promise<Response> {
 // Slack handlers
 
 async function handleSlackCommand(
-  _req: Request,
+  req: Request,
   rawBody: string,
 ): Promise<Response> {
   const form = new URLSearchParams(rawBody);
@@ -2126,6 +2101,12 @@ async function handleSlackCommand(
   const user_name = form.get("user_name") || "unknown";
   const channel_id = form.get("channel_id") || "";
   const channel_name = form.get("channel_name") || "unknown";
+  const trigger_id = form.get("trigger_id") || "";
+
+  // Log retry headers if present
+  logRetryHeaders(req, "slack/command");
+
+  console.log(`[slack/command] trigger_id=${trigger_id}, channel=${channel_id}, question="${question.slice(0, 50)}..."`);
 
   // STEP 1: Run director BEFORE any RAG/index work
   const routeDecision = await director(question);
@@ -2158,6 +2139,18 @@ async function handleSlackCommand(
 
   (async () => {
     try {
+      // DEDUPE CHECK: Skip if we've already processed this trigger_id
+      if (trigger_id && await seenSlashCommand(trigger_id)) {
+        console.log(`[slack/command] DEDUPED: trigger_id=${trigger_id} already processed`);
+        return;
+      }
+
+      // Mark as seen BEFORE processing to prevent double-post
+      if (trigger_id) {
+        await markSlashCommandSeen(trigger_id);
+        console.log(`[slack/command] Marked trigger_id=${trigger_id} as seen`);
+      }
+
       if (!channel_id) {
         throw new Error("Missing channel_id from Slack command payload.");
       }
@@ -2184,7 +2177,7 @@ async function handleSlackCommand(
         blocks: result.blocks,
       });
     } catch (e) {
-      console.error("Slash command background error:", e);
+      console.error("[slack/command] Background processing error:", e);
       try {
         if (channel_id) {
           await slackApi("chat.postMessage", {
@@ -2200,75 +2193,157 @@ async function handleSlackCommand(
 }
 
 async function handleSlackEvents(
-  _req: Request,
+  req: Request,
   rawBody: string,
 ): Promise<Response> {
   const payload = JSON.parse(rawBody);
 
+  // Handle URL verification (Slack setup)
   if (payload.type === "url_verification") {
     return json({ challenge: payload.challenge });
   }
 
+  // Only handle event_callback
   if (payload.type !== "event_callback") return json({ ok: true });
 
   const ev = payload.event;
-  if (ev?.bot_id || ev?.subtype === "bot_message") return json({ ok: true });
-  if (ev?.type !== "app_mention") return json({ ok: true });
+  const eventId = payload.event_id || "";
 
+  // Log retry headers if present
+  logRetryHeaders(req, "slack/events");
+
+  // Robust self-message filtering:
+  // - bot_id present = message from a bot
+  // - subtype === "bot_message" = bot message
+  // - user missing = system or unknown message
+  if (ev?.bot_id || ev?.subtype === "bot_message" || !ev?.user) {
+    console.log(`[slack/events] Ignoring: bot_id=${ev?.bot_id}, subtype=${ev?.subtype}, user=${ev?.user}`);
+    return json({ ok: true, ignored: "bot_or_system_message" });
+  }
+
+  // Only handle app_mention events
+  if (ev?.type !== "app_mention") {
+    return json({ ok: true, ignored: "not_app_mention" });
+  }
+
+  // FAST ACK: Return 200 immediately to prevent Slack retries
+  // Then process asynchronously
+  const ackResponse = json({ ok: true });
+
+  // Extract event data before async processing
   const channel = ev.channel;
   const ts = ev.ts;
-  const thread_ts = ev.thread_ts || ts;
+  // Compute reply thread: if this is in a thread, reply there; otherwise start new thread
+  const replyThreadTs = ev.thread_ts ?? ts;
   const user = ev.user || "unknown";
+  // Strip @mentions and trim
   const question = String(ev.text || "").replace(/<@[^>]+>/g, "").trim();
+  // Is this a follow-up in an existing thread?
+  const isThreadReply = Boolean(ev.thread_ts);
 
-  // STEP 1: Run director BEFORE any RAG/index work
-  const routeDecision = await director(question);
+  console.log(`[slack/events] event_id=${eventId}, channel=${channel}, thread_ts=${replyThreadTs}, isThreadReply=${isThreadReply}, question="${question.slice(0, 50)}..."`);
 
-  // STEP 2: If help route, reply with help blocks only (no RAG)
-  if (routeDecision.route === "help") {
+  // Process in background (non-blocking)
+  (async () => {
     try {
+      // DEDUPE CHECK: Skip if we've already processed this event
+      if (eventId && await seenEvent(eventId)) {
+        console.log(`[slack/events] DEDUPED: event_id=${eventId} already processed`);
+        return;
+      }
+
+      // Mark as seen BEFORE processing to prevent double-post on crash+retry
+      if (eventId) {
+        await markEventSeen(eventId);
+        console.log(`[slack/events] Marked event_id=${eventId} as seen`);
+      }
+
+      // Empty question after stripping mentions
+      if (!question) {
+        await slackApi("chat.postMessage", {
+          channel,
+          thread_ts: replyThreadTs,
+          text: "Hi! I'm CS Helper. Try asking me a question like: `@cs-helper how do I handle a stuck analysis?`\n\nOr type `@cs-helper help` to see what I can do.",
+        });
+        return;
+      }
+
+      // STEP 1: Run director BEFORE any RAG/index work
+      const routeDecision = await director(question);
+
+      // STEP 2: If help route, reply with help blocks only (no RAG)
+      if (routeDecision.route === "help") {
+        await slackApi("chat.postMessage", {
+          channel,
+          thread_ts: replyThreadTs,
+          text: "CS Helper — what I can do",
+          blocks: buildHelpBlocks(),
+        });
+        return;
+      }
+
+      // STEP 3: Check if this is a follow-up in an existing thread with saved state
+      if (isThreadReply) {
+        const existingState = await getThreadState(channel, replyThreadTs);
+        if (existingState) {
+          console.log(`[slack/events] Thread follow-up detected, using handleFollowupInThread`);
+          // This is a follow-up to an existing conversation
+          const result = await handleFollowupInThread({
+            channelId: channel,
+            threadTs: replyThreadTs,
+            user,
+            followupText: question,
+          });
+
+          if ("error" in result) {
+            await slackApi("chat.postMessage", {
+              channel,
+              thread_ts: replyThreadTs,
+              text: `⚠️ ${result.error}`,
+            });
+            return;
+          }
+
+          await slackApi("chat.postMessage", {
+            channel,
+            thread_ts: replyThreadTs,
+            text: "Follow-up response",
+            blocks: result.blocks,
+          });
+          return;
+        }
+      }
+
+      // STEP 4: For new questions (or follow-ups without state), process with RAG
+      const result = await handleQuestion(question, user, channel, {
+        includeLinear: true,
+        linearTimeoutMs: 1200,
+        threadContext: {
+          channelId: channel,
+          threadTs: replyThreadTs,
+        },
+      });
+
       await slackApi("chat.postMessage", {
         channel,
-        thread_ts,
-        text: "CS Helper — what I can do",
-        blocks: buildHelpBlocks(),
+        thread_ts: replyThreadTs,
+        text: "CS helper response",
+        blocks: result.blocks,
       });
-      return json({ ok: true });
     } catch (e) {
-      console.error("Help response error:", e);
-      return json({ ok: true, error: String((e as any)?.message || e) });
+      console.error("[slack/events] Background processing error:", e);
+      try {
+        await slackApi("chat.postMessage", {
+          channel,
+          thread_ts: replyThreadTs,
+          text: `⚠️ I hit an error answering that. Try /rebuild then ask again.\nError: ${String((e as any)?.message || e)}`,
+        });
+      } catch {}
     }
-  }
+  })();
 
-  // STEP 3: For answer routes, process with RAG
-  try {
-    // Pass thread context so follow-up button works
-    const result = await handleQuestion(question, user, channel, {
-      includeLinear: true,
-      linearTimeoutMs: 1200,
-      threadContext: {
-        channelId: channel,
-        threadTs: thread_ts,
-      },
-    });
-
-    await slackApi("chat.postMessage", {
-      channel,
-      thread_ts,
-      text: "CS helper response",
-      blocks: result.blocks,
-    });
-
-    return json({ ok: true });
-  } catch (e) {
-    console.error("Slack event handler error:", e);
-    await slackApi("chat.postMessage", {
-      channel,
-      thread_ts,
-      text: `⚠️ I hit an error answering that. Try /rebuild then ask again.\nError: ${String((e as any)?.message || e)}`,
-    });
-    return json({ ok: true, error: String((e as any)?.message || e) });
-  }
+  // Return fast ACK immediately
+  return ackResponse;
 }
 
 async function handleBlobDebug(): Promise<Response> {
@@ -2317,6 +2392,35 @@ async function handleThreadCleanup(): Promise<Response> {
       500,
     );
   }
+}
+
+// ============================================================================
+// Self-Test Harness (for validating event parsing/dedupe without Slack calls)
+// Usage: import { _test_parseSlackEvent, _test_simulateDedupe } from "./main.ts";
+// ============================================================================
+
+type TestEventResult = { shouldIgnore: boolean; ignoreReason?: string; computedThreadTs?: string; extractedQuestion?: string; isThreadReply?: boolean };
+
+/** Test helper: Parse mock Slack event, return computed values (no API calls) */
+export function _test_parseSlackEvent(p: { type?: string; event?: { type?: string; bot_id?: string; subtype?: string; user?: string; ts?: string; thread_ts?: string; text?: string } }): TestEventResult {
+  if (p.type === "url_verification") return { shouldIgnore: true, ignoreReason: "url_verification" };
+  if (p.type !== "event_callback") return { shouldIgnore: true, ignoreReason: "not_event_callback" };
+  const ev = p.event;
+  if (!ev) return { shouldIgnore: true, ignoreReason: "no_event" };
+  if (ev.bot_id) return { shouldIgnore: true, ignoreReason: "has_bot_id" };
+  if (ev.subtype === "bot_message") return { shouldIgnore: true, ignoreReason: "bot_message_subtype" };
+  if (!ev.user) return { shouldIgnore: true, ignoreReason: "no_user" };
+  if (ev.type !== "app_mention") return { shouldIgnore: true, ignoreReason: "not_app_mention" };
+  const ts = ev.ts || "";
+  return { shouldIgnore: false, computedThreadTs: ev.thread_ts ?? ts, extractedQuestion: String(ev.text || "").replace(/<@[^>]+>/g, "").trim(), isThreadReply: Boolean(ev.thread_ts) };
+}
+
+/** Test helper: Simulate dedupe with in-memory Map */
+export function _test_simulateDedupe(store: Map<string, number>, eventId: string, ttlMs = 600000): { deduped: boolean; action: "skip" | "process" } {
+  const now = Date.now(), seenAt = store.get(eventId);
+  if (seenAt !== undefined && now - seenAt <= ttlMs) return { deduped: true, action: "skip" };
+  store.set(eventId, now);
+  return { deduped: false, action: "process" };
 }
 
 // ============================================================================

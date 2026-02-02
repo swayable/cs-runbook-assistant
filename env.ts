@@ -49,6 +49,14 @@ export const THREAD_STATE_BLOB_PREFIX = "cs_thread_v1:";
 export const THREAD_STATE_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
 export const MAX_FOLLOWUPS = 5; // Max follow-ups to store per thread
 
+// Event dedupe storage (prevents duplicate processing on Slack retries)
+export const SLACK_EVENT_DEDUPE_PREFIX = "slack_event_v1:";
+export const SLACK_EVENT_DEDUPE_TTL_MS = 10 * 60 * 1000; // 10 minutes
+
+// Slash command dedupe storage
+export const SLASH_DEDUPE_PREFIX = "slash_dedupe_v1:";
+export const SLASH_DEDUPE_TTL_MS = 5 * 60 * 1000; // 5 minutes
+
 export function mustEnv(): void {
   const missing = [
     ["SLACK_BOT_TOKEN", SLACK_BOT_TOKEN],
