@@ -9,8 +9,8 @@
 
 import type { Chunk, ClassifierResult, EvidenceItem } from "../types/index.ts";
 
-const DEFAULT_MODEL = "claude-sonnet-4-20250514";
-const ENHANCE_TIMEOUT_MS = 15000; // 15 second timeout for LLM enhancement (Sonnet is slower)
+const DEFAULT_MODEL = "claude-3-5-haiku-20241022"; // Haiku is faster and good enough for step extraction
+const ENHANCE_TIMEOUT_MS = 8000; // 8 second timeout (Haiku is fast)
 const ENHANCE_MAX_RETRIES = 3; // Max retries for enhancement
 const ENHANCE_RETRY_DELAY_MS = 500; // Base delay between retries
 
