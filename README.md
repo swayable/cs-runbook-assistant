@@ -60,17 +60,60 @@ A Slack bot that searches Notion runbooks and helps CS team members find solutio
 
 ## Environment Variables
 
-Required:
-- `SLACK_BOT_TOKEN`
-- `SLACK_SIGNING_SECRET`
-- `NOTION_TOKEN`
-- `NOTION_ROOT_PAGE_ID`
-- `LINEAR_API_KEY`
+See `.env.example` for all available variables. Required:
+- `SLACK_BOT_TOKEN` - Slack bot token
+- `SLACK_SIGNING_SECRET` - Slack signing secret
+- `NOTION_TOKEN` - Notion integration token
+- `NOTION_ROOT_PAGE_ID` - Root page ID for runbooks
+- `LINEAR_API_KEY` - Linear API key
 
 Optional:
 - `LINEAR_TEAM_KEY` (default: "ENG")
 - `LINEAR_LABEL_NAME` (default: "CS Requests")
-- `PUBLIC_BASE_URL`
-- `CACHE_TTL_MS` (default: 3600000)
-- `LINEAR_TIMEOUT_MS` (default: 700)
+- `LINEAR_TIMEOUT_MS` (default: 5000)
+- `PUBLIC_BASE_URL` - Base URL for links
+- `MEM_CACHE_TTL_MS` (default: 3600000)
 - `BLOB_KEY` (default: "cs_runbook_index_v1")
+- `ANTHROPIC_API_KEY` - For LLM features
+- `OPENAI_API_KEY` - For hybrid search embeddings
+- `HYBRID_SEARCH_ENABLED` (default: 1)
+- `LLM_DIRECTOR_ENABLED` (default: 1)
+
+## Deployment to Val Town
+
+This project is deployed via the Val Town CLI (`vt`).
+
+### Prerequisites
+
+1. Install the Val Town CLI: `npm install -g @valtown/cli` or `deno install -A -n vt jsr:@valtown/cli`
+2. Authenticate: `vt login`
+3. Set environment variables in Val Town dashboard (Settings > Environment Variables)
+
+### Deploy
+
+```bash
+# From the repo root
+vt push
+
+# Or with verbose output
+vt push --verbose
+```
+
+### Local Development
+
+```bash
+# Add deno to PATH (if using conda environment)
+export PATH="/mnt/a61cc0e8-1b32-4574-a771-4ad77e8faab6/conda/.deno/bin:$PATH"
+
+# Type check
+deno check main.ts
+
+# Run locally
+deno task dev
+```
+
+### Configuration Files
+
+- `deno.json` - Deno/Val Town config
+- `.vtignore` - Files excluded from Val Town push
+- `.vt/state.json` - Local Val Town state (gitignored)

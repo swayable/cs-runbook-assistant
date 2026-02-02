@@ -1,19 +1,24 @@
 # Dependencies
 node_modules/
 
-# Environment
+# Environment - NEVER commit secrets
 .env
 .env.local
 .env.*.local
+*.env
 
 # IDE
 .idea/
 *.swp
 *.swo
+.vscode/settings.json
 
 # OS
 .DS_Store
 Thumbs.db
 
-# Val Town state
+# Val Town state (contains auth tokens)
 .vt/
+
+# Claude Code settings
+.claude/
