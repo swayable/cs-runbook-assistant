@@ -1895,6 +1895,8 @@ async function handleSearch(url: URL): Promise<Response> {
     state: string;
     reason: string;
   }> = [];
+  let ticketSource: "llm" | "keyword" | "none" = "none";
+  let ticketsFetched = 0;
 
   try {
     const teamId = await withTimeout(
@@ -1903,7 +1905,9 @@ async function handleSearch(url: URL): Promise<Response> {
       "linear team lookup",
     );
 
-    const { tickets } = await getRelatedTicketsWithLLM(q, teamId, 8000, 8);
+    const { tickets, source, issuesFetched } = await getRelatedTicketsWithLLM(q, teamId, 8000, 8);
+    ticketSource = source;
+    ticketsFetched = issuesFetched;
     relatedTickets = tickets.map((t) => ({
       identifier: t.issue.identifier,
       title: t.issue.title,
@@ -1947,6 +1951,8 @@ async function handleSearch(url: URL): Promise<Response> {
     related_tickets: relatedTickets,
     // Metadata
     search_source: searchSource,
+    ticket_source: ticketSource,
+    tickets_fetched: ticketsFetched,
     latency_ms: Date.now() - searchStartTime,
   };
 

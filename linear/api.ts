@@ -174,9 +174,11 @@ export async function fetchRecentIssues(teamId: string, daysBack = 7, maxIssues 
       since: sinceISO,
       first: maxIssues,
     }) as { team: { issues: { nodes: LinearIssue[] } } };
-    return data.team?.issues?.nodes || [];
+    const issues = data.team?.issues?.nodes || [];
+    console.log(`[fetchRecentIssues] teamId=${teamId}, since=${sinceISO}, found ${issues.length} issues`);
+    return issues;
   } catch (e) {
-    console.warn("fetchRecentIssues failed:", String((e as any)?.message || e));
+    console.warn("[fetchRecentIssues] Failed:", String((e as any)?.message || e));
     return [];
   }
 }
@@ -442,7 +444,7 @@ export async function getRelatedTicketsWithLLM(
   teamId: string,
   timeoutMs = 10000,
   maxResults = 8
-): Promise<{ tickets: LLMSelectedIssue[]; source: "llm" | "keyword" | "none" }> {
+): Promise<{ tickets: LLMSelectedIssue[]; source: "llm" | "keyword" | "none"; issuesFetched: number }> {
   // Fetch recent issues with timeout
   let issues: LinearIssue[] = [];
   try {
@@ -455,16 +457,19 @@ export async function getRelatedTicketsWithLLM(
     ]);
   } catch (e) {
     console.warn("[getRelatedTicketsWithLLM] Fetch failed:", String((e as any)?.message || e));
-    return { tickets: [], source: "none" };
+    return { tickets: [], source: "none", issuesFetched: 0 };
   }
 
+  console.log(`[getRelatedTicketsWithLLM] Fetched ${issues.length} issues from last 7 days`);
+
   if (issues.length === 0) {
-    return { tickets: [], source: "none" };
+    return { tickets: [], source: "none", issuesFetched: 0 };
   }
 
   // Use LLM to select relevant tickets (with remaining time budget)
   const tickets = await selectRelevantTicketsWithLLM(query, issues, maxResults);
   const source = Deno.env.get("ANTHROPIC_API_KEY") ? "llm" : "keyword";
 
-  return { tickets, source };
+  console.log(`[getRelatedTicketsWithLLM] LLM/keyword selected ${tickets.length} from ${issues.length} issues`);
+  return { tickets, source, issuesFetched: issues.length };
 }
