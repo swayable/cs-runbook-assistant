@@ -1895,19 +1895,12 @@ async function handleSearch(url: URL): Promise<Response> {
     state: string;
     reason: string;
   }> = [];
-  let ticketSource: "llm" | "keyword" | "none" = "none";
-  let ticketsFetched = 0;
+  let ticketMeta = { source: "none" as "llm" | "keyword" | "none", fetched: 0, team: LINEAR_TEAM_KEY, error: "" };
 
   try {
-    const teamId = await withTimeout(
-      getLinearTeamIdByKey(LINEAR_TEAM_KEY),
-      3000,
-      "linear team lookup",
-    );
-
+    const teamId = await withTimeout(getLinearTeamIdByKey(LINEAR_TEAM_KEY), 3000, "team lookup");
     const { tickets, source, issuesFetched } = await getRelatedTicketsWithLLM(q, teamId, 8000, 8);
-    ticketSource = source;
-    ticketsFetched = issuesFetched;
+    ticketMeta = { source, fetched: issuesFetched, team: LINEAR_TEAM_KEY, error: "" };
     relatedTickets = tickets.map((t) => ({
       identifier: t.issue.identifier,
       title: t.issue.title,
@@ -1916,7 +1909,7 @@ async function handleSearch(url: URL): Promise<Response> {
       reason: t.reason,
     }));
   } catch (e) {
-    console.warn("[/search] Related tickets fetch failed:", String((e as any)?.message || e));
+    ticketMeta.error = String((e as any)?.message || e).slice(0, 100);
   }
 
   // STEP 5: Get LLM summary with next_actions
@@ -1949,10 +1942,8 @@ async function handleSearch(url: URL): Promise<Response> {
     next_actions: nextActions,
     docs,
     related_tickets: relatedTickets,
-    // Metadata
     search_source: searchSource,
-    ticket_source: ticketSource,
-    tickets_fetched: ticketsFetched,
+    ticket_meta: ticketMeta,
     latency_ms: Date.now() - searchStartTime,
   };
 
