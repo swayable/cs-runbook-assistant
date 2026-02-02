@@ -8,6 +8,7 @@ import {
   LLM_DIRECTOR_TIMEOUT_MS,
   LLM_DIRECTOR_MODEL,
   LLM_DIRECTOR_MAX_TOKENS,
+  LLM_DIRECTOR_RETRIES,
 } from "../env.ts";
 
 const DIRECTOR_SYSTEM_PROMPT = `You are a query classifier for a Customer Support (CS) runbook assistant. Your job is to analyze user queries and determine:
@@ -75,6 +76,30 @@ async function withTimeout<T>(
   } finally {
     if (timer) clearTimeout(timer);
   }
+}
+
+/**
+ * Retry wrapper with exponential backoff
+ */
+async function withRetry<T>(
+  fn: () => Promise<T>,
+  maxRetries: number,
+  baseDelayMs = 500
+): Promise<T> {
+  let lastError: Error | null = null;
+  for (let attempt = 0; attempt < maxRetries; attempt++) {
+    try {
+      return await fn();
+    } catch (e) {
+      lastError = e as Error;
+      if (attempt < maxRetries - 1) {
+        const delay = baseDelayMs * Math.pow(2, attempt);
+        console.warn(`Director LLM attempt ${attempt + 1} failed, retrying in ${delay}ms...`);
+        await new Promise((r) => setTimeout(r, delay));
+      }
+    }
+  }
+  throw lastError;
 }
 
 /**
@@ -159,10 +184,13 @@ ${metadataContext}
 Classify this query.`;
 
   try {
-    const raw = await withTimeout(
-      callDirectorLLM(DIRECTOR_SYSTEM_PROMPT, userMessage, LLM_DIRECTOR_MAX_TOKENS),
-      LLM_DIRECTOR_TIMEOUT_MS,
-      "director_llm"
+    const raw = await withRetry(
+      () => withTimeout(
+        callDirectorLLM(DIRECTOR_SYSTEM_PROMPT, userMessage, LLM_DIRECTOR_MAX_TOKENS),
+        LLM_DIRECTOR_TIMEOUT_MS,
+        "director_llm"
+      ),
+      LLM_DIRECTOR_RETRIES
     );
 
     const latencyMs = Date.now() - startTime;
@@ -180,7 +208,7 @@ Classify this query.`;
     return { decision: parsed, latencyMs };
   } catch (e) {
     const latencyMs = Date.now() - startTime;
-    console.warn("Director LLM failed:", String((e as Error)?.message || e));
+    console.warn("Director LLM failed after retries:", String((e as Error)?.message || e));
     return { decision: null, latencyMs };
   }
 }
