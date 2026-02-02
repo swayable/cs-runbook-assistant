@@ -9,7 +9,7 @@
 
 import type { Chunk, ClassifierResult, EvidenceItem } from "../types/index.ts";
 
-const DEFAULT_MODEL = "claude-3-5-sonnet-20240620";
+const DEFAULT_MODEL = "claude-sonnet-4-20250514";
 
 // ============================================================================
 // Anthropic API caller
