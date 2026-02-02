@@ -42,7 +42,7 @@ function safeParseJson<T>(s: string): T | null {
 // Anthropic API
 // ============================================================================
 
-const DEFAULT_MODEL = "claude-3-5-sonnet-20240620";
+const DEFAULT_MODEL = "claude-sonnet-4-20250514";
 
 async function callAnthropic(
   systemPrompt: string,
