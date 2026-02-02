@@ -10,6 +10,7 @@
 import type { Chunk, ClassifierResult, EvidenceItem } from "../types/index.ts";
 
 const DEFAULT_MODEL = "claude-sonnet-4-20250514";
+const ENHANCE_TIMEOUT_MS = 10000; // 10 second timeout for LLM enhancement
 
 // ============================================================================
 // Anthropic API caller
@@ -25,6 +26,9 @@ async function callAnthropic(
 
   const model = Deno.env.get("ANTHROPIC_MODEL") || DEFAULT_MODEL;
 
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), ENHANCE_TIMEOUT_MS);
+
   try {
     const res = await fetch("https://api.anthropic.com/v1/messages", {
       method: "POST",
@@ -39,7 +43,10 @@ async function callAnthropic(
         system: systemPrompt,
         messages: [{ role: "user", content: userMessage }],
       }),
+      signal: controller.signal,
     });
+
+    clearTimeout(timeoutId);
 
     if (!res.ok) {
       console.error("Anthropic API error:", res.status, await res.text());
@@ -49,7 +56,12 @@ async function callAnthropic(
     const data = await res.json();
     return data?.content?.[0]?.text || null;
   } catch (e) {
-    console.error("Anthropic call failed:", e);
+    clearTimeout(timeoutId);
+    if ((e as Error).name === "AbortError") {
+      console.warn("LLM enhancement timed out after", ENHANCE_TIMEOUT_MS, "ms");
+    } else {
+      console.error("Anthropic call failed:", e);
+    }
     return null;
   }
 }
