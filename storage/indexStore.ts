@@ -3,7 +3,8 @@
 import { blob } from "https://esm.town/v/std/blob";
 import {
   BLOB_KEY,
-  CACHE_TTL_MS,
+  MEM_CACHE_TTL_MS,
+  BLOB_MAX_AGE_MS,
   NOTION_ROOT_PAGE_ID,
   NOTION_TOKEN,
   PUBLIC_BASE_URL,
@@ -21,10 +22,10 @@ export function getCache(): typeof CACHE {
 // Blob operations
 export async function blobGetIndex(): Promise<IndexPayload | null> {
   try {
-    const payload = await blob.getJSON(BLOB_KEY);
+    const payload = await blob.getJSON(BLOB_KEY) as IndexPayload | null;
     if (!payload) return null;
     if (!payload.builtAtMs || !Array.isArray(payload.chunks)) return null;
-    return payload as IndexPayload;
+    return payload;
   } catch (e) {
     console.warn("blobGetIndex failed:", String((e as any)?.message || e));
     return null;
@@ -220,31 +221,49 @@ function chunkPage(
 }
 
 // Build index (memory -> blob -> notion)
+// New semantics:
+// - Memory cache: use if fresh per MEM_CACHE_TTL_MS
+// - Blob cache: ALWAYS use if exists (even if stale), track staleness in diag
+// - Only throw "Index not ready" when blob is MISSING AND allowNotion=false
+// - Only crawl Notion when allowNotion=true (i.e., /rebuild endpoint)
 export async function buildIndex(
   force = false,
   opts: BuildOpts = {},
-): Promise<{ chunks: Chunk[]; diag: any; source: string }> {
+): Promise<{ chunks: Chunk[]; diag: any; source: string; stale?: boolean; blobAgeMs?: number }> {
   const allowNotion = opts.allowNotion === true;
 
-  // 1) memory
-  if (!force && CACHE && Date.now() - CACHE.builtAtMs < CACHE_TTL_MS) {
+  // 1) Memory cache: use if fresh per MEM_CACHE_TTL_MS
+  if (!force && CACHE && Date.now() - CACHE.builtAtMs < MEM_CACHE_TTL_MS) {
     return { chunks: CACHE.chunks, diag: CACHE.diag, source: "memory" };
   }
 
-  // 2) blob (fast, survives cold starts)
+  // 2) Blob cache: ALWAYS use if exists, even if stale
+  // We only use blob age to compute staleness warning, NOT to reject the data
   if (!force) {
     const fromBlob = await blobGetIndex();
-    if (fromBlob && Date.now() - fromBlob.builtAtMs < CACHE_TTL_MS) {
+    if (fromBlob) {
+      const blobAgeMs = Date.now() - fromBlob.builtAtMs;
+      const isStale = blobAgeMs > BLOB_MAX_AGE_MS;
+
+      // Refresh in-memory cache from blob
       CACHE = {
         builtAtMs: fromBlob.builtAtMs,
         chunks: fromBlob.chunks,
         diag: fromBlob.diag,
       };
-      return { chunks: fromBlob.chunks, diag: fromBlob.diag, source: "blob" };
+
+      return {
+        chunks: fromBlob.chunks,
+        diag: fromBlob.diag,
+        source: "blob",
+        stale: isStale,
+        blobAgeMs,
+      };
     }
   }
 
-  // 3) notion crawl (slow) — ONLY allowed on /rebuild
+  // 3) No blob found — either crawl Notion or throw error
+  // Notion crawl (slow) — ONLY allowed on /rebuild
   if (!allowNotion) {
     const hint = PUBLIC_BASE_URL ? `${PUBLIC_BASE_URL}/rebuild` : "/rebuild";
     throw new Error(`Index not ready. Run ${hint}`);

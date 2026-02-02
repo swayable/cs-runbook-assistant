@@ -2,8 +2,37 @@
 //
 // Single file implementation for Val Town.
 // All business logic consolidated here.
+//
+// ============================================================================
+// CRON SETUP (Optional - for always-warm cache)
+// ============================================================================
+//
+// To keep the CS runbook assistant always available without /rebuild after idle:
+//
+// 1. Create a Val Town Cron val that hits /rebuild nightly to refresh the index:
+//    ```ts
+//    // cron: 0 3 * * *  (runs at 3 AM UTC daily)
+//    export default async function rebuildIndex() {
+//      const res = await fetch("YOUR_VAL_URL/rebuild");
+//      console.log("Rebuild result:", await res.text());
+//    }
+//    ```
+//
+// 2. (Optional) Create a Cron val that hits /warm every 15-30 minutes to keep
+//    the in-memory cache fresh (reduces cold-start latency):
+//    ```ts
+//    // cron: */15 * * * *  (runs every 15 minutes)
+//    export default async function warmCache() {
+//      const res = await fetch("YOUR_VAL_URL/warm");
+//      console.log("Warm result:", await res.json());
+//    }
+//    ```
+//
+// The /warm endpoint only loads from blob storage (no Notion crawl), so it's
+// cheap and fast. The /rebuild endpoint crawls Notion and updates the blob.
+// ============================================================================
 
-import { mustEnv, BLOB_KEY, LINEAR_API_KEY, LINEAR_TEAM_KEY, LINEAR_LABEL_NAME, LINEAR_TIMEOUT_MS } from "./env.ts";
+import { mustEnv, BLOB_KEY, LINEAR_API_KEY, LINEAR_TEAM_KEY, LINEAR_LABEL_NAME, LINEAR_TIMEOUT_MS, BLOB_MAX_AGE_MS } from "./env.ts";
 import { json, text } from "./util/response.ts";
 import {
   buildIndex,
@@ -949,23 +978,74 @@ async function handleSlackActions(
 
 async function handleHealth(): Promise<Response> {
   const cache = getCache();
-  const ageSec = cache ? Math.floor((Date.now() - cache.builtAtMs) / 1000) : null;
+  const memCacheAgeSec = cache ? Math.floor((Date.now() - cache.builtAtMs) / 1000) : null;
 
-  let indexExists = false;
+  // Check blob status
+  let blobPresent = false;
+  let blobAgeSec: number | null = null;
+  let blobStale = false;
+  let blobBuiltAt: string | null = null;
+  let chunkCount = 0;
+
   try {
     const indexData = await blobGetIndex();
-    indexExists = indexData !== null;
+    if (indexData) {
+      blobPresent = true;
+      const blobAgeMs = Date.now() - indexData.builtAtMs;
+      blobAgeSec = Math.floor(blobAgeMs / 1000);
+      blobStale = blobAgeMs > BLOB_MAX_AGE_MS;
+      blobBuiltAt = indexData.diag?.builtAt || null;
+      chunkCount = indexData.chunks?.length || 0;
+    }
   } catch {}
+
+  // Use cache chunk count if available, otherwise use blob chunk count
+  if (cache?.chunks?.length) {
+    chunkCount = cache.chunks.length;
+  }
 
   return json({
     ok: true,
     cached: Boolean(cache),
-    cache_age_sec: ageSec,
-    chunkCount: cache?.chunks?.length || 0,
-    builtAt: cache?.diag?.builtAt || null,
+    mem_cache_age_sec: memCacheAgeSec,
+    chunkCount,
+    blob_present: blobPresent,
+    blob_age_sec: blobAgeSec,
+    builtAt: blobBuiltAt || cache?.diag?.builtAt || null,
+    stale: blobStale,
     blobKey: BLOB_KEY,
-    indexExists,
   });
+}
+
+// /warm endpoint: Cheap cache warming from blob (no Notion crawl)
+// Use this endpoint for periodic cache warming (e.g., every 15-30 minutes)
+// It loads from blob if available, refreshes in-memory cache, and returns health info
+async function handleWarm(): Promise<Response> {
+  try {
+    // Try to load from blob (no Notion crawl)
+    const { chunks, diag, source, stale, blobAgeMs } = await buildIndex(false, {
+      allowNotion: false,
+    });
+
+    return json({
+      ok: true,
+      warmed: true,
+      source,
+      chunkCount: chunks.length,
+      builtAt: diag?.builtAt || null,
+      stale: stale || false,
+      blob_age_sec: blobAgeMs ? Math.floor(blobAgeMs / 1000) : null,
+      blobKey: BLOB_KEY,
+    });
+  } catch (e) {
+    // Blob doesn't exist - that's fine, just report it
+    return json({
+      ok: false,
+      warmed: false,
+      error: "No blob index found. Run /rebuild to create one.",
+      blobKey: BLOB_KEY,
+    });
+  }
 }
 
 async function handleRebuild(url: URL): Promise<Response> {
@@ -987,11 +1067,14 @@ async function handleDebug(): Promise<Response> {
   return json(diag);
 }
 
+const LLM_SEARCH_TIMEOUT_MS = 12000; // 12s timeout for LLM calls in /search
+
 async function handleSearch(url: URL): Promise<Response> {
   const q = url.searchParams.get("q") || "";
+  const useLLM = url.searchParams.get("llm") === "1";
 
   // Get chunks without crawling Notion
-  const { chunks } = await buildIndex(false, { allowNotion: false });
+  const { chunks, stale, blobAgeMs } = await buildIndex(false, { allowNotion: false });
 
   // Run director
   const decision = await director(q, chunks);
@@ -1007,23 +1090,63 @@ async function handleSearch(url: URL): Promise<Response> {
     })),
   };
 
+  // Include cache staleness info
+  if (stale !== undefined) {
+    response.cache_stale = stale;
+  }
+  if (blobAgeMs !== undefined) {
+    response.cache_age_sec = Math.floor(blobAgeMs / 1000);
+  }
+
   if (decision.kind === "capabilities") {
     // Return capabilities text, don't rank runbooks
-    const capText = await llmCapabilities();
-    response.capabilities = capText;
+    // Only call LLM if llm=1 is set
+    if (useLLM) {
+      try {
+        const capText = await withTimeout(
+          llmCapabilities(),
+          LLM_SEARCH_TIMEOUT_MS,
+          "llmCapabilities",
+        );
+        response.capabilities = capText;
+      } catch (e) {
+        response.capabilities = STATIC_CAPABILITIES;
+        response.llm_error = String((e as any)?.message || e);
+      }
+    } else {
+      response.capabilities = STATIC_CAPABILITIES;
+    }
   } else if (decision.kind === "runbook") {
-    // Include LLM summary
-    const llmResult = await llmSummarize(q, decision.hits);
-    response.llm = {
-      summary: llmResult.summary,
-      recommendation: llmResult.recommendation,
-    };
+    // Only include LLM summary if llm=1 is set
+    if (useLLM) {
+      try {
+        const llmResult = await withTimeout(
+          llmSummarize(q, decision.hits),
+          LLM_SEARCH_TIMEOUT_MS,
+          "llmSummarize",
+        );
+        response.llm = {
+          summary: llmResult.summary,
+          recommendation: llmResult.recommendation,
+        };
+      } catch (e) {
+        // Fallback on timeout/error
+        response.llm = {
+          summary: `Refer to "${decision.hits[0]?.chunk.pageTitle || "runbook"}" for guidance.`,
+          recommendation: "try_steps",
+        };
+        response.llm_error = String((e as any)?.message || e);
+      }
+    }
+    // If llm=0 (default), no llm field in response
   } else if (decision.kind === "no_relevant") {
-    // Short no-relevant summary
-    response.llm = {
-      summary: "No relevant runbook content found for this query.",
-      recommendation: "file_ticket",
-    };
+    // Short no-relevant summary (no LLM needed)
+    if (useLLM) {
+      response.llm = {
+        summary: "No relevant runbook content found for this query.",
+        recommendation: "file_ticket",
+      };
+    }
   }
 
   return json(response);
@@ -1220,6 +1343,9 @@ export default async function handler(req: Request): Promise<Response> {
     // Basic endpoints
     if (req.method === "GET" && url.pathname === "/health") {
       return await handleHealth();
+    }
+    if (req.method === "GET" && url.pathname === "/warm") {
+      return await handleWarm();
     }
     if (req.method === "GET" && url.pathname === "/rebuild") {
       return await handleRebuild(url);
