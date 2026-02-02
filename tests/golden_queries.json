@@ -1,0 +1,142 @@
+{
+  "_readme": [
+    "Golden queries for retrieval evaluation.",
+    "",
+    "Run: deno task eval",
+    "Or: deno run --allow-env --allow-net scripts/eval.ts",
+    "",
+    "Each query defines expected behavior:",
+    "- expected_docs: words that should appear in top result titles",
+    "- expected_score_min: minimum acceptable score for top result",
+    "- expected_score_max: maximum acceptable score (for negative tests)",
+    "- expected_tickets_min: minimum number of related tickets (for ticket queries)"
+  ],
+  "config": {
+    "base_url": "http://localhost:8000",
+    "timeout_ms": 15000,
+    "precision_at_1_target": 0.80,
+    "precision_at_3_target": 0.90
+  },
+  "golden_queries": [
+    {
+      "id": "GQ-001",
+      "query": "how do I set up a typing tool",
+      "type": "how_to",
+      "expected_docs": ["Typing", "Tool", "Setup", "Configuration"],
+      "expected_score_min": 0.3,
+      "description": "Feature setup question - should match setup/config runbooks"
+    },
+    {
+      "id": "GQ-002",
+      "query": "why is a workflow stuck pending",
+      "type": "troubleshooting",
+      "expected_docs": ["Pending", "Workflow", "Stuck", "Analysis"],
+      "expected_score_min": 0.4,
+      "description": "Classic troubleshooting - 'stuck' should semantically match 'pending'"
+    },
+    {
+      "id": "GQ-003",
+      "query": "how do I generate inputs",
+      "type": "how_to",
+      "expected_docs": ["Input", "Generate", "Survey", "Create"],
+      "expected_score_min": 0.3,
+      "description": "Direct keyword should work well here"
+    },
+    {
+      "id": "GQ-004",
+      "query": "what is the escalation process",
+      "type": "info_gathering",
+      "expected_docs": ["Escalation", "Process", "Engineer", "Ticket"],
+      "expected_score_min": 0.4,
+      "description": "Process documentation lookup"
+    },
+    {
+      "id": "GQ-005",
+      "query": "analysis is broken",
+      "type": "troubleshooting_vague",
+      "expected_docs": ["Analysis", "Pending", "Error", "Stuck"],
+      "expected_score_min": 0.2,
+      "description": "Vague query - should still find analysis runbooks"
+    },
+    {
+      "id": "GQ-006",
+      "query": "finalize not showing up for test",
+      "type": "troubleshooting",
+      "expected_docs": ["Finalize", "Test", "Complete"],
+      "expected_score_min": 0.4,
+      "description": "Specific troubleshooting with product terms"
+    },
+    {
+      "id": "GQ-007",
+      "query": "customer says export failed",
+      "type": "troubleshooting",
+      "expected_docs": ["Export", "CSV", "Download", "Data"],
+      "expected_score_min": 0.3,
+      "description": "Customer-reported issue framing"
+    },
+    {
+      "id": "GQ-008",
+      "query": "reanalyze a completed test",
+      "type": "how_to",
+      "expected_docs": ["Reanalyze", "Analysis", "Test"],
+      "expected_score_min": 0.4,
+      "description": "Process question about reanalysis"
+    },
+    {
+      "id": "GQ-009",
+      "query": "what info do I need for stuck analysis",
+      "type": "info_gathering",
+      "expected_docs": ["Pending", "Analysis", "Information", "Gather"],
+      "expected_score_min": 0.3,
+      "description": "Pre-escalation info gathering"
+    },
+    {
+      "id": "GQ-010",
+      "query": "survey won't complete",
+      "type": "troubleshooting",
+      "expected_docs": ["Survey", "Complete", "Finalize"],
+      "expected_score_min": 0.3,
+      "description": "Semantic match: 'complete' should match 'finalize'"
+    },
+    {
+      "id": "GQ-011",
+      "query": "tracker not updating",
+      "type": "troubleshooting",
+      "expected_docs": ["Tracker", "Report", "Monthly", "Update"],
+      "expected_score_min": 0.3,
+      "description": "Reporting/tracker issues"
+    },
+    {
+      "id": "GQ-012",
+      "query": "preprocessing error",
+      "type": "troubleshooting",
+      "expected_docs": ["Preprocess", "Error", "Analysis"],
+      "expected_score_min": 0.4,
+      "description": "Direct keyword match for preprocessing issues"
+    },
+    {
+      "id": "NEG-001",
+      "query": "weather forecast tomorrow",
+      "type": "negative",
+      "expected_docs": [],
+      "expected_score_max": 0.25,
+      "description": "Should NOT match any runbook well"
+    },
+    {
+      "id": "NEG-002",
+      "query": "how to deploy kubernetes",
+      "type": "negative",
+      "expected_docs": [],
+      "expected_score_max": 0.25,
+      "description": "Engineering task, not CS runbook"
+    },
+    {
+      "id": "NEG-003",
+      "query": "recipe for chocolate cake",
+      "type": "negative",
+      "expected_docs": [],
+      "expected_score_max": 0.20,
+      "description": "Completely off-topic"
+    }
+  ]
+}
