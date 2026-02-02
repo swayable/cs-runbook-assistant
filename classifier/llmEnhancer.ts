@@ -25,10 +25,18 @@ async function callAnthropicOnce(
   model: string
 ): Promise<string | null> {
   const apiKey = Deno.env.get("ANTHROPIC_API_KEY");
-  if (!apiKey) return null;
+  if (!apiKey) {
+    console.log(`[enhanceWithLLM/api] No API key`);
+    return null;
+  }
 
+  console.log(`[enhanceWithLLM/api] Starting fetch to Anthropic (model=${model}, timeout=${ENHANCE_TIMEOUT_MS}ms)...`);
+  const fetchStartTime = Date.now();
   const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), ENHANCE_TIMEOUT_MS);
+  const timeoutId = setTimeout(() => {
+    console.log(`[enhanceWithLLM/api] Timeout triggered after ${ENHANCE_TIMEOUT_MS}ms`);
+    controller.abort();
+  }, ENHANCE_TIMEOUT_MS);
 
   try {
     const res = await fetch("https://api.anthropic.com/v1/messages", {
@@ -48,17 +56,21 @@ async function callAnthropicOnce(
     });
 
     clearTimeout(timeoutId);
+    console.log(`[enhanceWithLLM/api] Fetch complete in ${Date.now() - fetchStartTime}ms, status=${res.status}`);
 
     if (!res.ok) {
       const errText = await res.text();
-      console.error("Anthropic API error:", res.status, errText);
+      console.error("[enhanceWithLLM/api] API error:", res.status, errText);
       throw new Error(`API error ${res.status}: ${errText.slice(0, 100)}`);
     }
 
     const data = await res.json();
-    return data?.content?.[0]?.text || null;
+    const text = data?.content?.[0]?.text || null;
+    console.log(`[enhanceWithLLM/api] Response parsed, text length=${text?.length || 0}`);
+    return text;
   } catch (e) {
     clearTimeout(timeoutId);
+    console.log(`[enhanceWithLLM/api] Catch block hit after ${Date.now() - fetchStartTime}ms: ${(e as Error).name} - ${(e as Error).message}`);
     if ((e as Error).name === "AbortError") {
       throw new Error(`Timeout after ${ENHANCE_TIMEOUT_MS}ms`);
     }
@@ -124,8 +136,12 @@ export async function enhanceWithLLM(
   chunks: Chunk[],
   baseResult: ClassifierResult
 ): Promise<ClassifierResult> {
+  const startTime = Date.now();
+  console.log(`[enhanceWithLLM] Starting enhancement...`);
+
   // If no API key, return base result
   if (!Deno.env.get("ANTHROPIC_API_KEY")) {
+    console.log(`[enhanceWithLLM] No API key, returning base result`);
     return baseResult;
   }
 
@@ -134,6 +150,7 @@ export async function enhanceWithLLM(
     const excerpt = c.text.slice(0, 500).replace(/\n+/g, " ");
     return `[${i + 1}] Page: ${c.pageTitle}\nSection: ${c.sectionTitle}\nURL: ${c.url}\nContent: ${excerpt}`;
   }).join("\n\n");
+  console.log(`[enhanceWithLLM] Built context from ${Math.min(chunks.length, 3)} chunks`);
 
   const systemPrompt = `You are a CS support assistant that analyzes runbooks to extract actionable steps for Customer Support agents.
 
@@ -172,11 +189,21 @@ ${context}
 
 Enhance this classification with better step descriptions and reasoning. Remember: you CANNOT change can_cs_handle.`;
 
+  console.log(`[enhanceWithLLM] Calling Anthropic API...`);
   const raw = await callAnthropic(systemPrompt, userMessage);
-  if (!raw) return baseResult;
+  console.log(`[enhanceWithLLM] API call complete, raw response length: ${raw?.length || 0}`);
+
+  if (!raw) {
+    console.log(`[enhanceWithLLM] No response from API, returning base result after ${Date.now() - startTime}ms`);
+    return baseResult;
+  }
 
   const enhancement = safeParseJson<LLMEnhancement>(raw);
-  if (!enhancement) return baseResult;
+  if (!enhancement) {
+    console.log(`[enhanceWithLLM] Failed to parse JSON, returning base result after ${Date.now() - startTime}ms`);
+    return baseResult;
+  }
+  console.log(`[enhanceWithLLM] Parsed enhancement: ${enhancement.enhanced_cs_steps?.length || 0} steps`);
 
   // Merge LLM enhancements with base result
   // IMPORTANT: Never override the core can_cs_handle decision
@@ -203,6 +230,7 @@ Enhance this classification with better step descriptions and reasoning. Remembe
     }
   }
 
+  console.log(`[enhanceWithLLM] Complete in ${Date.now() - startTime}ms`);
   return result;
 }
 

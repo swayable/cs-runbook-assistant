@@ -3,40 +3,74 @@
 import { blob } from "https://esm.town/v/std/blob";
 import {
   BLOB_KEY,
+  BLOB_KEY_V2,
   MEM_CACHE_TTL_MS,
   BLOB_MAX_AGE_MS,
   NOTION_ROOT_PAGE_ID,
   NOTION_TOKEN,
   PUBLIC_BASE_URL,
+  OPENAI_API_KEY,
+  MAX_EMBED_CHUNKS,
 } from "../env.ts";
-import type { Chunk, IndexPayload, NotionBlock, BuildOpts } from "../types/index.ts";
+import type {
+  Chunk,
+  IndexPayload,
+  IndexPayloadV2,
+  AnyIndexPayload,
+  ChunkWithEmbedding,
+  NotionBlock,
+  BuildOpts,
+} from "../types/index.ts";
+import { isV2Index } from "../types/index.ts";
 import { extractLinearRefs, notionUrlForId, uniq } from "../util/text.ts";
+import { embedBatch, EMBEDDING_MODEL, EMBEDDING_DIMS } from "../retrieval/embeddings.ts";
 
 // In-memory cache (resets on code changes / cold starts)
-let CACHE: { builtAtMs: number; chunks: Chunk[]; diag: any } | null = null;
+// Can hold either v1 or v2 index
+let CACHE: { builtAtMs: number; chunks: Chunk[] | ChunkWithEmbedding[]; diag: any; version?: 1 | 2 } | null = null;
 
 export function getCache(): typeof CACHE {
   return CACHE;
 }
 
-// Blob operations
-export async function blobGetIndex(): Promise<IndexPayload | null> {
+// Blob operations - prefer v2 index when available
+export async function blobGetIndex(): Promise<{ payload: AnyIndexPayload; version: 1 | 2 } | null> {
+  // Try v2 first
   try {
-    const payload = await blob.getJSON(BLOB_KEY) as IndexPayload | null;
-    if (!payload) return null;
-    if (!payload.builtAtMs || !Array.isArray(payload.chunks)) return null;
-    return payload;
+    const v2 = await blob.getJSON(BLOB_KEY_V2) as IndexPayloadV2 | null;
+    if (v2 && isV2Index(v2) && v2.builtAtMs && Array.isArray(v2.chunks)) {
+      return { payload: v2, version: 2 };
+    }
   } catch (e) {
-    console.warn("blobGetIndex failed:", String((e as any)?.message || e));
-    return null;
+    console.warn("blobGetIndex v2 failed:", String((e as any)?.message || e));
   }
+
+  // Fall back to v1
+  try {
+    const v1 = await blob.getJSON(BLOB_KEY) as IndexPayload | null;
+    if (v1 && v1.builtAtMs && Array.isArray(v1.chunks)) {
+      return { payload: v1, version: 1 };
+    }
+  } catch (e) {
+    console.warn("blobGetIndex v1 failed:", String((e as any)?.message || e));
+  }
+
+  return null;
 }
 
-export async function blobSetIndex(payload: IndexPayload): Promise<void> {
+export async function blobSetIndexV1(payload: IndexPayload): Promise<void> {
   try {
     await blob.setJSON(BLOB_KEY, payload);
   } catch (e) {
-    console.warn("blobSetIndex failed:", String((e as any)?.message || e));
+    console.warn("blobSetIndex v1 failed:", String((e as any)?.message || e));
+  }
+}
+
+export async function blobSetIndexV2(payload: IndexPayloadV2): Promise<void> {
+  try {
+    await blob.setJSON(BLOB_KEY_V2, payload);
+  } catch (e) {
+    console.warn("blobSetIndex v2 failed:", String((e as any)?.message || e));
   }
 }
 
@@ -220,6 +254,64 @@ function chunkPage(
   return chunks.filter((c) => c.text.trim().length > 0);
 }
 
+// Helper to generate embeddings for chunks in batches
+async function generateEmbeddings(
+  chunks: Chunk[]
+): Promise<{ chunksWithEmbeddings: ChunkWithEmbedding[]; chunksEmbedded: number } | null> {
+  if (!OPENAI_API_KEY) {
+    console.warn("OPENAI_API_KEY not set, skipping embedding generation");
+    return null;
+  }
+
+  const chunksToEmbed = chunks.slice(0, MAX_EMBED_CHUNKS);
+  if (chunksToEmbed.length < chunks.length) {
+    console.warn(`Truncating to ${MAX_EMBED_CHUNKS} chunks for embedding (total: ${chunks.length})`);
+  }
+
+  // Prepare embedding texts: Title + Section + Content (truncated)
+  const texts = chunksToEmbed.map((c) =>
+    `Title: ${c.pageTitle}\nSection: ${c.sectionTitle}\nContent: ${c.text.slice(0, 800)}`
+  );
+
+  const chunksWithEmbeddings: ChunkWithEmbedding[] = [];
+  const BATCH_SIZE = 100;
+  const BATCH_DELAY_MS = 100;
+
+  try {
+    for (let i = 0; i < texts.length; i += BATCH_SIZE) {
+      const batchTexts = texts.slice(i, i + BATCH_SIZE);
+      const batchChunks = chunksToEmbed.slice(i, i + BATCH_SIZE);
+
+      const embeddings = await embedBatch(batchTexts);
+
+      for (let j = 0; j < batchChunks.length; j++) {
+        chunksWithEmbeddings.push({
+          ...batchChunks[j],
+          embedding: embeddings[j],
+        });
+      }
+
+      // Small delay between batches to avoid rate limiting
+      if (i + BATCH_SIZE < texts.length) {
+        await new Promise((r) => setTimeout(r, BATCH_DELAY_MS));
+      }
+    }
+
+    // Add remaining chunks without embeddings if truncated
+    for (let i = chunksToEmbed.length; i < chunks.length; i++) {
+      chunksWithEmbeddings.push({
+        ...chunks[i],
+        embedding: [], // Empty embedding for truncated chunks
+      });
+    }
+
+    return { chunksWithEmbeddings, chunksEmbedded: chunksToEmbed.length };
+  } catch (e) {
+    console.error("Embedding generation failed:", String((e as any)?.message || e));
+    return null;
+  }
+}
+
 // Build index (memory -> blob -> notion)
 // New semantics:
 // - Memory cache: use if fresh per MEM_CACHE_TTL_MS
@@ -229,12 +321,17 @@ function chunkPage(
 export async function buildIndex(
   force = false,
   opts: BuildOpts = {},
-): Promise<{ chunks: Chunk[]; diag: any; source: string; stale?: boolean; blobAgeMs?: number }> {
+): Promise<{ chunks: Chunk[] | ChunkWithEmbedding[]; diag: any; source: string; stale?: boolean; blobAgeMs?: number; indexVersion: 1 | 2 }> {
   const allowNotion = opts.allowNotion === true;
 
   // 1) Memory cache: use if fresh per MEM_CACHE_TTL_MS
   if (!force && CACHE && Date.now() - CACHE.builtAtMs < MEM_CACHE_TTL_MS) {
-    return { chunks: CACHE.chunks, diag: CACHE.diag, source: "memory" };
+    return {
+      chunks: CACHE.chunks,
+      diag: CACHE.diag,
+      source: "memory",
+      indexVersion: CACHE.version || 1,
+    };
   }
 
   // 2) Blob cache: ALWAYS use if exists, even if stale
@@ -242,22 +339,24 @@ export async function buildIndex(
   if (!force) {
     const fromBlob = await blobGetIndex();
     if (fromBlob) {
-      const blobAgeMs = Date.now() - fromBlob.builtAtMs;
+      const blobAgeMs = Date.now() - fromBlob.payload.builtAtMs;
       const isStale = blobAgeMs > BLOB_MAX_AGE_MS;
 
       // Refresh in-memory cache from blob
       CACHE = {
-        builtAtMs: fromBlob.builtAtMs,
-        chunks: fromBlob.chunks,
-        diag: fromBlob.diag,
+        builtAtMs: fromBlob.payload.builtAtMs,
+        chunks: fromBlob.payload.chunks,
+        diag: fromBlob.payload.diag,
+        version: fromBlob.version,
       };
 
       return {
-        chunks: fromBlob.chunks,
-        diag: fromBlob.diag,
-        source: "blob",
+        chunks: fromBlob.payload.chunks,
+        diag: fromBlob.payload.diag,
+        source: fromBlob.version === 2 ? "blob-v2" : "blob-v1",
         stale: isStale,
         blobAgeMs,
+        indexVersion: fromBlob.version,
       };
     }
   }
@@ -307,31 +406,76 @@ export async function buildIndex(
 
   chunksPerPage.sort((a, b) => a.chunks - b.chunks);
 
-  const diag = {
+  // Generate embeddings if OPENAI_API_KEY is available
+  const embeddingResult = await generateEmbeddings(chunks);
+
+  // Base diagnostics
+  const baseDiag = {
     pages: childPages.length,
     totalBlocks,
     textBlocks,
     chunkCount: chunks.length,
-    topBlockTypes: Object.entries(typeCounts).sort((a, b) => b[1] - a[1]).slice(
-      0,
-      15,
-    ),
+    topBlockTypes: Object.entries(typeCounts).sort((a, b) => b[1] - a[1]).slice(0, 15),
     lowestChunkPages: chunksPerPage.slice(0, 10),
     highestChunkPages: chunksPerPage.slice(-10),
     builtAt: new Date().toISOString(),
     blobKey: BLOB_KEY,
   };
 
-  const payload: IndexPayload = { builtAtMs: Date.now(), diag, chunks };
+  const builtAtMs = Date.now();
+
+  // Always write v1 index (without embeddings for backward compatibility)
+  const v1Diag = {
+    ...baseDiag,
+    embeddingModel: null,
+    embeddingDims: null,
+    chunksEmbedded: 0,
+  };
+  const v1Payload: IndexPayload = { builtAtMs, diag: v1Diag, chunks };
+  await blobSetIndexV1(v1Payload);
+
+  // Write v2 index if embeddings were generated
+  if (embeddingResult) {
+    const v2Diag = {
+      ...baseDiag,
+      embeddingModel: EMBEDDING_MODEL,
+      embeddingDims: EMBEDDING_DIMS,
+      chunksEmbedded: embeddingResult.chunksEmbedded,
+    };
+    const v2Payload: IndexPayloadV2 = {
+      version: 2,
+      builtAtMs,
+      diag: v2Diag,
+      chunks: embeddingResult.chunksWithEmbeddings,
+    };
+    await blobSetIndexV2(v2Payload);
+
+    // Cache v2 version
+    CACHE = {
+      builtAtMs,
+      chunks: embeddingResult.chunksWithEmbeddings,
+      diag: v2Diag,
+      version: 2,
+    };
+
+    return {
+      chunks: embeddingResult.chunksWithEmbeddings,
+      diag: v2Diag,
+      source: "notion",
+      indexVersion: 2,
+    };
+  }
+
+  // No embeddings - cache and return v1
   CACHE = {
-    builtAtMs: payload.builtAtMs,
-    chunks: payload.chunks,
-    diag: payload.diag,
+    builtAtMs,
+    chunks,
+    diag: v1Diag,
+    version: 1,
   };
 
-  await blobSetIndex(payload);
-  return { chunks, diag, source: "notion" };
+  return { chunks, diag: v1Diag, source: "notion", indexVersion: 1 };
 }
 
 // Re-export blob for debug endpoint
-export { blob, BLOB_KEY };
+export { blob, BLOB_KEY, BLOB_KEY_V2 };

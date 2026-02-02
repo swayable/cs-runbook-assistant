@@ -9,6 +9,7 @@ import type { FollowupEntry } from "../types/index.ts";
 export type LlmSummary = {
   summary: string;
   recommendation: "file_ticket" | "try_steps";
+  next_actions?: string[]; // 3-6 actionable bullets
 };
 
 export type Ranked = {
@@ -30,12 +31,38 @@ export type Ranked = {
 
 function safeParseJson<T>(s: string): T | null {
   try {
+    // Try to extract JSON from markdown code blocks if present
     const jsonMatch = s.match(/```(?:json)?\s*([\s\S]*?)```/);
-    const toParse = jsonMatch ? jsonMatch[1].trim() : s.trim();
-    return JSON.parse(toParse) as T;
+    let toParse = jsonMatch ? jsonMatch[1].trim() : s.trim();
+
+    // Try to extract JSON object if there's extra text around it
+    const objectMatch = toParse.match(/\{[\s\S]*\}/);
+    if (objectMatch) {
+      toParse = objectMatch[0];
+    }
+
+    const parsed = JSON.parse(toParse);
+
+    // Basic validation that it's an object
+    if (typeof parsed !== "object" || parsed === null) {
+      return null;
+    }
+
+    return parsed as T;
   } catch {
     return null;
   }
+}
+
+/**
+ * Sanitize user input for use in prompts.
+ * Removes control characters and truncates to reasonable length.
+ */
+function sanitizeInput(input: string, maxLength = 1000): string {
+  // Remove control characters except newlines and tabs
+  const cleaned = input.replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, "");
+  // Truncate to max length
+  return cleaned.slice(0, maxLength);
 }
 
 // ============================================================================
@@ -43,6 +70,7 @@ function safeParseJson<T>(s: string): T | null {
 // ============================================================================
 
 const DEFAULT_MODEL = "claude-sonnet-4-20250514";
+const SUMMARIZE_TIMEOUT_MS = 15000; // 15 second timeout for summarization (safe with two-endpoint pattern)
 
 async function callAnthropic(
   systemPrompt: string,
@@ -53,6 +81,12 @@ async function callAnthropic(
   if (!apiKey) return null;
 
   const model = Deno.env.get("ANTHROPIC_MODEL") || DEFAULT_MODEL;
+  console.log(`[llm/summarize] Calling Anthropic (model=${model})...`);
+  const startTime = Date.now();
+
+  // Create AbortController for timeout
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), SUMMARIZE_TIMEOUT_MS);
 
   try {
     const res = await fetch("https://api.anthropic.com/v1/messages", {
@@ -68,7 +102,10 @@ async function callAnthropic(
         system: systemPrompt,
         messages: [{ role: "user", content: userMessage }],
       }),
+      signal: controller.signal,
     });
+
+    clearTimeout(timeoutId);
 
     if (!res.ok) {
       console.error("Anthropic API error:", res.status, await res.text());
@@ -77,8 +114,14 @@ async function callAnthropic(
 
     const data = await res.json();
     const content = data?.content?.[0]?.text;
+    console.log(`[llm/summarize] API complete in ${Date.now() - startTime}ms, response length: ${content?.length || 0}`);
     return content || null;
   } catch (e) {
+    clearTimeout(timeoutId);
+    if ((e as Error).name === "AbortError") {
+      console.error(`[llm/summarize] Timeout after ${SUMMARIZE_TIMEOUT_MS}ms`);
+      return null;
+    }
     console.error("Anthropic call failed:", e);
     return null;
   }
@@ -96,6 +139,8 @@ export async function llmSummarize(
   hits: Ranked[],
   noContextReason?: string
 ): Promise<LlmSummary> {
+  const startTime = Date.now();
+  console.log(`[llmSummarize] Starting, hits=${hits.length}, noContextReason=${noContextReason || 'none'}`);
   const hasContext = hits.length > 0 && !noContextReason;
 
   // Fallback if no API key
@@ -104,6 +149,11 @@ export async function llmSummarize(
       return {
         summary: `Check the "${hits[0].chunk.pageTitle}" runbook for steps to address this issue.`,
         recommendation: "try_steps",
+        next_actions: [
+          `Review the "${hits[0].chunk.pageTitle}" runbook`,
+          "Follow the documented troubleshooting steps",
+          "Gather required information before escalating",
+        ],
       };
     }
     return {
@@ -111,6 +161,12 @@ export async function llmSummarize(
         ? `I couldn't search the runbooks (${noContextReason}). Please describe the issue in more detail or check with your team lead.`
         : "I couldn't find a clear match. Please provide more details about the issue.",
       recommendation: "file_ticket",
+      next_actions: [
+        "Provide more specific details about the issue",
+        "Include any error messages or screenshots",
+        "Note the customer name and test/survey URL",
+        "Consider escalating if the issue is time-sensitive",
+      ],
     };
   }
 
@@ -130,31 +186,42 @@ export async function llmSummarize(
       : "NO RUNBOOK MATCHES FOUND for this query.";
   }
 
-  const systemPrompt = `You are a CS support assistant. Based on runbook excerpts (if available), provide a brief summary and recommendation.
+  const systemPrompt = `You are a CS support assistant. Based on runbook excerpts (if available), provide a brief summary, recommendation, and actionable next steps.
 Respond ONLY with valid JSON in this exact format:
-{"summary": "...", "recommendation": "try_steps" or "file_ticket"}
+{"summary": "...", "recommendation": "try_steps" or "file_ticket", "next_actions": ["action 1", "action 2", ...]}
 
 Rules:
-- summary: 1-3 sentences summarizing what to do. Max 600 chars.
+- summary: 2-5 sentences summarizing the situation and what to do. Max 600 chars.
 - If runbook context is available: summarize the steps from the runbook.
-- If NO runbook context: acknowledge this and suggest next steps (gather info, escalate, etc.)
-- recommendation: "try_steps" if there are actionable CS steps, "file_ticket" if it needs engineering or no steps are clear.
-- Keep it concise and actionable.
+- If NO runbook context: be SUPPORTIVE and ACTION-ORIENTED. Suggest gathering specific info.
+- recommendation: "try_steps" if there are actionable CS steps, "file_ticket" if it needs engineering.
+- next_actions: 3-6 specific, actionable bullet points. Each should be a clear action the CS agent can take.
+- Be supportive and helpful, never dismissive.
 - Do not reveal internal systems, secrets, or code snippets.`;
 
   const userMessage = `User question: ${question}\n\nRunbook context:\n${contextSection}`;
 
-  const raw = await callAnthropic(systemPrompt, userMessage);
+  const raw = await callAnthropic(systemPrompt, userMessage, 700);
   if (!raw) {
     if (hasContext) {
       return {
         summary: `Refer to "${hits[0]?.chunk.pageTitle || "runbook"}" for guidance.`,
         recommendation: "try_steps",
+        next_actions: [
+          `Review the "${hits[0]?.chunk.pageTitle}" runbook`,
+          "Follow the documented steps",
+          "Gather customer details before proceeding",
+        ],
       };
     }
     return {
       summary: "Unable to generate summary. Please describe the issue in detail for manual review.",
       recommendation: "file_ticket",
+      next_actions: [
+        "Describe the issue in more detail",
+        "Include error messages or screenshots",
+        "Note customer name and relevant URLs",
+      ],
     };
   }
 
@@ -163,10 +230,15 @@ Rules:
     const summary =
       parsed.summary.length > 600 ? parsed.summary.slice(0, 597) + "..." : parsed.summary;
     const rec = parsed.recommendation === "file_ticket" ? "file_ticket" : "try_steps";
-    return { summary, recommendation: rec };
+    const nextActions = Array.isArray(parsed.next_actions)
+      ? parsed.next_actions.slice(0, 6).map((a) => String(a).slice(0, 200))
+      : undefined;
+    console.log(`[llmSummarize] Complete in ${Date.now() - startTime}ms, rec=${rec}, actions=${nextActions?.length || 0}`);
+    return { summary, recommendation: rec, next_actions: nextActions };
   }
 
   const truncated = raw.length > 600 ? raw.slice(0, 597) + "..." : raw;
+  console.log(`[llmSummarize] Complete (raw fallback) in ${Date.now() - startTime}ms`);
   return { summary: truncated, recommendation: hasContext ? "try_steps" : "file_ticket" };
 }
 

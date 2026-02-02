@@ -1,0 +1,144 @@
+{
+  "_readme": [
+    "Test cases for validating hybrid embedding search quality.",
+    "",
+    "How to run manual tests:",
+    "1. Start the dev server: deno task dev",
+    "2. For each test case, call: curl 'http://localhost:8080/search?q=<query>'",
+    "3. Check that:",
+    "   - At least one expectedMatch word appears in the top result's pageTitle",
+    "   - The top score meets the minScore threshold",
+    "",
+    "Example:",
+    "  curl 'http://localhost:8080/search?q=stuck+analysis'",
+    "  Expected: top result contains 'Pending' in title, score >= 0.5"
+  ],
+  "testCases": [
+    {
+      "type": "semantic",
+      "query": "stuck analysis",
+      "expectedMatches": ["Pending", "Analysis"],
+      "minScore": 0.5,
+      "description": "Semantic match: 'stuck' should match 'pending'"
+    },
+    {
+      "type": "semantic",
+      "query": "survey won't complete",
+      "expectedMatches": ["Finalize", "Complete"],
+      "minScore": 0.4,
+      "description": "Semantic match: 'complete' should match 'finalize'"
+    },
+    {
+      "type": "semantic",
+      "query": "tracker broken",
+      "expectedMatches": ["Reporting", "Monthly", "Tracker"],
+      "minScore": 0.4,
+      "description": "Semantic match: 'tracker' + 'broken' should match reporting issues"
+    },
+    {
+      "type": "semantic",
+      "query": "export not working",
+      "expectedMatches": ["Export", "CSV", "Download"],
+      "minScore": 0.4,
+      "description": "Semantic match: 'export' should find export-related runbooks"
+    },
+    {
+      "type": "semantic",
+      "query": "can't see results",
+      "expectedMatches": ["Results", "Analysis", "Dashboard"],
+      "minScore": 0.4,
+      "description": "Semantic match: 'results' should match analysis/dashboard content"
+    },
+    {
+      "type": "semantic",
+      "query": "frozen state",
+      "expectedMatches": ["Pending", "Stuck", "State"],
+      "minScore": 0.4,
+      "description": "Semantic match: 'frozen' should match 'pending/stuck'"
+    },
+    {
+      "type": "semantic",
+      "query": "user can't login",
+      "expectedMatches": ["Login", "Authentication", "Access"],
+      "minScore": 0.4,
+      "description": "Semantic match: 'login' should find auth-related content"
+    },
+    {
+      "type": "semantic",
+      "query": "data not syncing",
+      "expectedMatches": ["Sync", "Data", "Integration"],
+      "minScore": 0.4,
+      "description": "Semantic match: 'syncing' should find integration issues"
+    },
+    {
+      "type": "semantic",
+      "query": "panel disappeared",
+      "expectedMatches": ["Panel", "UI", "Display"],
+      "minScore": 0.4,
+      "description": "Semantic match: 'disappeared' should find UI visibility issues"
+    },
+    {
+      "type": "semantic",
+      "query": "email notification missing",
+      "expectedMatches": ["Email", "Notification", "Alert"],
+      "minScore": 0.4,
+      "description": "Semantic match: should find notification configuration content"
+    },
+    {
+      "type": "keyword",
+      "query": "pending state",
+      "expectedMatches": ["Pending"],
+      "minScore": 0.7,
+      "description": "Direct keyword match should score higher"
+    },
+    {
+      "type": "keyword",
+      "query": "finalize blocked",
+      "expectedMatches": ["Finalize", "Blocked"],
+      "minScore": 0.6,
+      "description": "Direct keyword match for finalize issues"
+    },
+    {
+      "type": "keyword",
+      "query": "reanalyze test",
+      "expectedMatches": ["Reanalyze", "Test", "Analysis"],
+      "minScore": 0.6,
+      "description": "Direct keyword match for reanalysis"
+    },
+    {
+      "type": "keyword",
+      "query": "preprocessing error",
+      "expectedMatches": ["Preprocessing", "Preprocess", "Error"],
+      "minScore": 0.6,
+      "description": "Direct keyword match for preprocessing issues"
+    },
+    {
+      "type": "keyword",
+      "query": "monthly report",
+      "expectedMatches": ["Monthly", "Report"],
+      "minScore": 0.6,
+      "description": "Direct keyword match for reporting"
+    },
+    {
+      "type": "negative",
+      "query": "weather forecast tomorrow",
+      "expectedMatches": [],
+      "maxScore": 0.3,
+      "description": "Irrelevant query should not match well"
+    },
+    {
+      "type": "negative",
+      "query": "recipe for chocolate cake",
+      "expectedMatches": [],
+      "maxScore": 0.3,
+      "description": "Completely unrelated query should have low score"
+    },
+    {
+      "type": "negative",
+      "query": "stock market predictions 2026",
+      "expectedMatches": [],
+      "maxScore": 0.3,
+      "description": "Off-topic financial query should not match"
+    }
+  ]
+}

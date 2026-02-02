@@ -42,8 +42,12 @@ import {
   rankPossibleDuplicates,
   uniqByUrlOrId,
   selectHighlyRelevantIssues,
+  getRelatedTicketsWithLLM,
+  fetchRecentIssues,
   type LinearIssue,
+  type LLMSelectedIssue,
 } from "./linear/api.ts";
+import { searchNotionDirect, docResultToRanked, isNotionConfigured } from "./retrieval/notionSearch.ts";
 
 // ============================================================================
 // Types (local types that aren't in extracted modules)
@@ -236,6 +240,10 @@ function isHelpQuery(question: string): boolean {
   return false;
 }
 
+// NOTE: Fast out-of-scoping behavior REMOVED per requirements.
+// We now always attempt retrieval + summarization for all non-help queries.
+// This ensures supportive, action-oriented responses even for unclear questions.
+
 /**
  * Director function: runs BEFORE any RAG/index work.
  * Determines whether to show help or proceed with answer flow.
@@ -269,6 +277,10 @@ async function director(question: string): Promise<{ route: RouteDecision; direc
     return { route: { route: "help" }, directorLatencyMs: 0 };
   }
 
+  // NOTE: Fast out-of-scoping behavior REMOVED per requirements.
+  // We now always proceed to RAG for all non-help queries to provide
+  // supportive, action-oriented responses.
+
   // STEP 2: Run LLM director if enabled (bounded by timeout)
   const metadata = await getRunbookMetadata();
   const { decision: llmDecision, latencyMs } = await runLLMDirector(question, metadata);
@@ -280,20 +292,10 @@ async function director(question: string): Promise<{ route: RouteDecision; direc
       return { route: { route: "help" }, directorLatencyMs: latencyMs };
     }
 
-    // Out of scope with high confidence - skip RAG
-    if (llmDecision.intent === "out_of_scope" && llmDecision.confidence === "high") {
-      return {
-        route: {
-          route: "answer",
-          doRag: false,
-          reason: llmDecision.out_of_scope_reason || "query not related to runbooks",
-          directorHint: llmDecision,
-        },
-        directorLatencyMs: latencyMs,
-      };
-    }
+    // NOTE: out_of_scope handling REMOVED - we now always attempt RAG
+    // Even for "out of scope" queries, we provide supportive responses
 
-    // In-scope: proceed to RAG with hints
+    // All queries proceed to RAG with hints
     return {
       route: { route: "answer", doRag: true, directorHint: llmDecision },
       directorLatencyMs: latencyMs,
@@ -392,6 +394,54 @@ function buildHelpBlocks(): any[] {
       ],
     },
   ];
+}
+
+/**
+ * Build Slack blocks for supportive response when unclear.
+ * NOTE: This is now used for any unclear/unmatched query, not just "out of scope".
+ */
+function buildSupportiveBlocks(llmSummary?: string, nextActions?: string[]): any[] {
+  const blocks: any[] = [
+    {
+      type: "section",
+      text: {
+        type: "mrkdwn",
+        text: llmSummary
+          ? `*Let me help you with that*\n\n${llmSummary}`
+          : "*I'd like to help with this issue*\n\nI couldn't find a specific runbook match, but I can still assist you.",
+      },
+    },
+  ];
+
+  if (nextActions && nextActions.length > 0) {
+    blocks.push({
+      type: "section",
+      text: {
+        type: "mrkdwn",
+        text: `*Suggested next steps:*\n${nextActions.slice(0, 6).map((a) => `• ${a}`).join("\n")}`,
+      },
+    });
+  }
+
+  blocks.push({
+    type: "section",
+    text: {
+      type: "mrkdwn",
+      text: "*I can help with:*\n• Customer issues and troubleshooting\n• Finding runbook steps and procedures\n• Triaging delivery problems\n• Gathering required info for escalations",
+    },
+  });
+
+  blocks.push({
+    type: "context",
+    elements: [
+      {
+        type: "mrkdwn",
+        text: "💡 For best results, include specific error messages, customer names, or feature areas in your question.",
+      },
+    ],
+  });
+
+  return blocks;
 }
 
 // ============================================================================
@@ -580,61 +630,66 @@ function buildTicketDescription(args: {
   ].join("\n");
 }
 
-// Build Slack blocks for no_relevant response
+// Build Slack blocks for no_relevant response - SUPPORTIVE and ACTION-ORIENTED
 function buildNoRelevantBlocks(args: {
   question: string;
   requiredInfo: string[];
   llmSummary?: string;
+  nextActions?: string[]; // From LLM response
   actionId?: string;
   threadKey?: string; // channelId:threadTs for follow-up button
   directorHint?: DirectorDecision;
 }): any[] {
-  const reqInfoText = args.requiredInfo.slice(0, 6).map((x) => `• ${x}`).join("\n");
-  const { directorHint } = args;
+  // SUPPORTIVE header - never dismissive
+  const headerText = "*Let me help you with this*";
 
-  // Customize header and suggestion based on director insight
-  let headerText: string;
-  let suggestionText: string;
-
-  if (directorHint?.intent === "out_of_scope") {
-    headerText = "*This doesn't seem to be covered by our runbooks*";
-    suggestionText = directorHint.out_of_scope_reason
-      ? `${directorHint.out_of_scope_reason}\n\nIf this is a customer issue, try rephrasing with specific error messages or symptoms.`
-      : "This query appears to be outside the scope of CS runbooks. If it's a customer issue, try adding more context.";
-  } else if (directorHint?.matched_topics?.length) {
-    headerText = "*No exact match found*";
-    const topics = directorHint.matched_topics.slice(0, 4).join(", ");
-    suggestionText = `I searched runbooks related to: ${topics}\n\nTry being more specific about the error or symptom.`;
-  } else {
-    headerText = "*No strong runbook match found*";
-    suggestionText = "I couldn't find a relevant runbook page for your question. This might be a new issue type or require more specific details.";
-  }
-
-  // Add expanded query hint if available
-  if (directorHint?.expanded_query && directorHint.expanded_query.toLowerCase() !== args.question.toLowerCase()) {
-    suggestionText += `\n\n_Try searching:_ "${directorHint.expanded_query}"`;
-  }
-
+  // Use LLM summary if available, otherwise provide supportive fallback
   const summaryText = args.llmSummary
-    ? `*Summary*\n${args.llmSummary}\n\n`
-    : "";
+    ? args.llmSummary
+    : "I couldn't find a specific runbook match, but I can still help you work through this issue.";
 
   const blocks: any[] = [
     {
       type: "section",
       text: {
         type: "mrkdwn",
-        text: `${headerText}\n\n${summaryText}${suggestionText}`,
-      },
-    },
-    {
-      type: "section",
-      text: {
-        type: "mrkdwn",
-        text: `*Can you provide more details?*\nTry rephrasing with specific error messages, feature names, or symptoms.\n\n*Info to collect for escalation*\n${reqInfoText}`,
+        text: `${headerText}\n\n${summaryText}`,
       },
     },
   ];
+
+  // Show next actions from LLM if available
+  if (args.nextActions && args.nextActions.length > 0) {
+    const actionsText = args.nextActions.slice(0, 6).map((a) => `• ${a}`).join("\n");
+    blocks.push({
+      type: "section",
+      text: {
+        type: "mrkdwn",
+        text: `*Suggested next steps:*\n${actionsText}`,
+      },
+    });
+  }
+
+  // Always show info to collect (helpful for escalation)
+  const reqInfoText = args.requiredInfo.slice(0, 6).map((x) => `• ${x}`).join("\n");
+  blocks.push({
+    type: "section",
+    text: {
+      type: "mrkdwn",
+      text: `*Info to collect for this issue:*\n${reqInfoText}`,
+    },
+  });
+
+  // Helpful hint
+  blocks.push({
+    type: "context",
+    elements: [
+      {
+        type: "mrkdwn",
+        text: "💡 Include specific error messages, customer names, or feature areas for better results.",
+      },
+    ],
+  });
 
   // Build action buttons
   const actionElements: any[] = [];
@@ -653,7 +708,6 @@ function buildNoRelevantBlocks(args: {
     actionElements.push({
       type: "button",
       text: { type: "plain_text", text: "File ENG ticket (CS Requests)" },
-      style: "primary",
       action_id: "create_linear_ticket",
       value: args.actionId,
     });
@@ -679,14 +733,15 @@ function buildNoRelevantBlocks(args: {
 // Build Slack blocks for runbook response with classifier results
 function buildRunbookBlocks(args: {
   summary: string;
+  nextActions?: string[]; // From LLM response
+  recommendation: "file_ticket" | "try_steps";
   classifier: ClassifierResult;
   runbookHits: Ranked[];
-  duplicates: LinearIssue[];
-  duplicatesOverflow?: number; // Additional matching tickets not shown
+  relatedTickets: LLMSelectedIssue[]; // Tickets with LLM-provided reasons
   actionId: string;
   threadKey?: string; // channelId:threadTs for follow-up button
 }): any[] {
-  const { classifier } = args;
+  const { classifier, recommendation } = args;
 
   // Build classification header
   const canHandle = classifier.can_cs_handle;
@@ -694,16 +749,56 @@ function buildRunbookBlocks(args: {
     ? `*CS can handle this* (${classifier.confidence} confidence)`
     : `*Escalate to Engineering* (${classifier.confidence} confidence)`;
 
+  const blocks: any[] = [
+    {
+      type: "section",
+      text: { type: "mrkdwn", text: `${classificationText}\n\n*Summary*\n${args.summary}` },
+    },
+  ];
+
+  // Show next actions from LLM (new feature)
+  if (args.nextActions && args.nextActions.length > 0) {
+    const actionsText = args.nextActions.slice(0, 6).map((a) => `• ${a}`).join("\n");
+    blocks.push({
+      type: "section",
+      text: { type: "mrkdwn", text: `*Suggested next steps:*\n${actionsText}` },
+    });
+  }
+
   // Build reasons
   const reasonsText = classifier.reasons.slice(0, 3).map((r) => `• ${r}`).join("\n");
+
+  // Show reasons for classification
+  if (reasonsText) {
+    blocks.push({
+      type: "section",
+      text: { type: "mrkdwn", text: `*Why?*\n${reasonsText}` },
+    });
+  }
 
   // Build CS-safe steps (only if CS can handle)
   const stepsText = canHandle && classifier.cs_safe_steps.length > 0
     ? classifier.cs_safe_steps.slice(0, 5).map((s, i) => `${i + 1}. ${s}`).join("\n")
     : null;
 
+  // Show CS-safe steps if CS can handle
+  if (stepsText) {
+    blocks.push({
+      type: "section",
+      text: { type: "mrkdwn", text: `*Steps CS can take*\n${stepsText}` },
+    });
+  }
+
   // Build escalation info (always show if not CS-handlable, or as backup)
   const escalationText = classifier.escalation_info_needed.slice(0, 6).map((x) => `• ${x}`).join("\n");
+
+  // Show escalation info if engineer required
+  if (!canHandle) {
+    blocks.push({
+      type: "section",
+      text: { type: "mrkdwn", text: `*Info to collect for escalation*\n${escalationText}` },
+    });
+  }
 
   // Build citations from evidence
   const citations = classifier.evidence.length > 0
@@ -718,58 +813,25 @@ function buildRunbookBlocks(args: {
           .join("\n")
       : "• (none)";
 
-  // Build related tickets text (already filtered and selected upstream)
-  let dupText: string;
-  if (args.duplicates.length === 0) {
-    dupText = "• None found";
-  } else {
-    const lines = args.duplicates
-      .map((d) => `• <${d.url}|${d.identifier}> — ${d.title} (${d.state?.name || "Unknown"})`);
-    if (args.duplicatesOverflow && args.duplicatesOverflow > 0) {
-      lines.push(`• …and ${args.duplicatesOverflow} more matching ticket${args.duplicatesOverflow === 1 ? "" : "s"}`);
-    }
-    dupText = lines.join("\n");
-  }
-
-  const blocks: any[] = [
-    {
-      type: "section",
-      text: { type: "mrkdwn", text: `${classificationText}\n\n*Summary*\n${args.summary}` },
-    },
-  ];
-
-  // Show reasons for classification
-  if (reasonsText) {
-    blocks.push({
-      type: "section",
-      text: { type: "mrkdwn", text: `*Why?*\n${reasonsText}` },
-    });
-  }
-
-  // Show CS-safe steps if CS can handle
-  if (stepsText) {
-    blocks.push({
-      type: "section",
-      text: { type: "mrkdwn", text: `*Steps CS can take*\n${stepsText}` },
-    });
-  }
-
-  // Show escalation info if engineer required
-  if (!canHandle) {
-    blocks.push({
-      type: "section",
-      text: { type: "mrkdwn", text: `*Info to collect for escalation*\n${escalationText}` },
-    });
-  }
-
   blocks.push({
     type: "section",
     text: { type: "mrkdwn", text: `*Runbook sources*\n${citations}` },
   });
 
+  // Build related tickets text with reasons (from LLM selection)
+  let ticketText: string;
+  if (args.relatedTickets.length === 0) {
+    ticketText = "• None found in last 7 days";
+  } else {
+    ticketText = args.relatedTickets
+      .slice(0, 8)
+      .map((t) => `• <${t.issue.url}|${t.issue.identifier}> — ${t.issue.title}\n  _${t.reason}_`)
+      .join("\n");
+  }
+
   blocks.push({
     type: "section",
-    text: { type: "mrkdwn", text: `*Related tickets in Linear*\n${dupText}` },
+    text: { type: "mrkdwn", text: `*Related tickets (last 7 days)*\n${ticketText}` },
   });
 
   // Build action buttons
@@ -785,14 +847,16 @@ function buildRunbookBlocks(args: {
     });
   }
 
-  // Add file ticket button (primary if engineer required)
-  actionElements.push({
-    type: "button",
-    text: { type: "plain_text", text: "File ENG ticket (CS Requests)" },
-    style: !canHandle ? "primary" : undefined,
-    action_id: "create_linear_ticket",
-    value: args.actionId,
-  });
+  // Add file ticket button ONLY when recommendation is file_ticket OR not CS-handlable
+  if (recommendation === "file_ticket" || !canHandle) {
+    actionElements.push({
+      type: "button",
+      text: { type: "plain_text", text: "File ENG ticket (CS Requests)" },
+      style: "primary",
+      action_id: "create_linear_ticket",
+      value: args.actionId,
+    });
+  }
 
   // Add dismiss button
   actionElements.push({
@@ -953,13 +1017,17 @@ async function handleQuestion(
   slackChannel?: string,
   opts: AnswerOpts = {},
 ): Promise<AnswerResult> {
+  console.log(`[handleQuestion] ENTRY: question="${question.slice(0, 50)}..."`);
+
   // Build thread key for follow-up button if thread context is provided
   const threadKeyStr = opts.threadContext
     ? `${opts.threadContext.channelId}:${opts.threadContext.threadTs}`
     : undefined;
 
   // STEP 1: Run director BEFORE any RAG/index work
+  console.log(`[handleQuestion] STEP 1: Running director...`);
   const { route: routeDecision, directorLatencyMs } = await director(question);
+  console.log(`[handleQuestion] Director complete: route=${routeDecision.route}, latency=${directorLatencyMs}ms`);
 
   // STEP 2: If help route, return help immediately (NO RAG, NO index loading)
   if (routeDecision.route === "help") {
@@ -970,6 +1038,9 @@ async function handleQuestion(
       ragUsed: false,
     };
   }
+
+  // NOTE: Early out-of-scope exit REMOVED per requirements.
+  // We now always proceed to retrieval for supportive, action-oriented responses.
 
   // Extract director hint for later use
   const directorHint = "directorHint" in routeDecision ? routeDecision.directorHint : undefined;
@@ -1070,6 +1141,7 @@ async function handleQuestion(
         question,
         requiredInfo,
         llmSummary: llmResult.summary,
+        nextActions: llmResult.next_actions,
         actionId,
         threadKey: threadKeyStr,
         directorHint,
@@ -1088,9 +1160,9 @@ async function handleQuestion(
   // Run the classifier on the relevant chunks
   console.log(`[handleQuestion] Running classifier...`);
   const classifierResult = classify(question, hitChunks);
-  console.log(`[handleQuestion] Classifier done: ${classifierResult.verdict}`);
+  console.log(`[handleQuestion] Classifier done: can_cs_handle=${classifierResult.can_cs_handle}`);
 
-  // Optionally enhance with LLM (if API key available)
+  // Enhance with LLM (now safe with two-endpoint pattern giving us full execution time)
   console.log(`[handleQuestion] Running enhanceWithLLM...`);
   const enhancedClassifier = await enhanceWithLLM(question, hitChunks, classifierResult);
   console.log(`[handleQuestion] enhanceWithLLM done`);
@@ -1100,22 +1172,10 @@ async function handleQuestion(
   const llmResult = await llmSummarize(question, hits);
   console.log(`[handleQuestion] llmSummarize complete: ${llmResult.summary.slice(0, 50)}...`);
 
-  // Linear duplicates (optional + time-bounded)
+  // Fetch related tickets using LLM selection (last 7 days, no state filtering)
+  let relatedTickets: LLMSelectedIssue[] = [];
   const includeLinear = opts.includeLinear === true;
   const linearTimeoutMs = opts.linearTimeoutMs ?? LINEAR_TIMEOUT_MS;
-
-  // Runbook-embedded references (cheap; no API call)
-  const embeddedRefs = uniq(hitChunks.flatMap((c) => c.ticketRefs));
-  const embeddedAsIssues: LinearIssue[] = embeddedRefs.slice(0, 3).map((url, idx) => ({
-    id: `embedded-${idx}`,
-    identifier: "RELATED",
-    title: "Referenced in runbook",
-    url,
-    state: null,
-  }));
-
-  let duplicates: LinearIssue[] = [];
-  let duplicatesOverflow = 0;
 
   if (includeLinear) {
     try {
@@ -1125,30 +1185,42 @@ async function handleQuestion(
         "linear team lookup",
       );
 
-      const found = await withTimeout(
-        searchLinearIssues(question, teamId),
-        linearTimeoutMs,
-        "linear search",
+      // Use new LLM-based ticket selection
+      const { tickets, source } = await getRelatedTicketsWithLLM(
+        question,
+        teamId,
+        linearTimeoutMs * 2, // Allow more time for LLM selection
+        8
       );
-
-      // Combine embedded refs with Linear search, deduplicate, then filter and select
-      const combined = uniqByUrlOrId([...embeddedAsIssues, ...found]);
-      const { selected, overflow } = selectHighlyRelevantIssues(question, combined);
-      duplicates = selected;
-      duplicatesOverflow = overflow;
+      relatedTickets = tickets;
+      console.log(`[handleQuestion] Related tickets: ${tickets.length} (source: ${source})`);
     } catch (e) {
-      console.warn("Linear duplicate search timed out/failed:", String((e as any)?.message || e));
-      // Fall back to filtered embedded refs only
-      const { selected, overflow } = selectHighlyRelevantIssues(question, embeddedAsIssues);
-      duplicates = selected;
-      duplicatesOverflow = overflow;
+      console.warn("Linear ticket fetch failed:", String((e as any)?.message || e));
+      relatedTickets = [];
     }
-  } else {
-    // No Linear search, use filtered embedded refs only
-    const { selected, overflow } = selectHighlyRelevantIssues(question, embeddedAsIssues);
-    duplicates = selected;
-    duplicatesOverflow = overflow;
   }
+
+  // Add runbook-embedded references as fallback
+  const embeddedRefs = uniq(hitChunks.flatMap((c) => c.ticketRefs));
+  for (const url of embeddedRefs.slice(0, 3)) {
+    // Only add if not already in relatedTickets
+    const alreadyExists = relatedTickets.some((t) => t.issue.url === url);
+    if (!alreadyExists) {
+      relatedTickets.push({
+        issue: {
+          id: `embedded-${url}`,
+          identifier: "RELATED",
+          title: "Referenced in runbook",
+          url,
+          state: null,
+        },
+        reason: "Referenced in runbook documentation",
+      });
+    }
+  }
+
+  // Convert relatedTickets to LinearIssue[] for buildTicketDescription (backward compat)
+  const ticketIssues = relatedTickets.map((t) => t.issue);
 
   // Escalation payload (stored server-side)
   const ticketTitle = `[CS] ${question.slice(0, 90)}${question.length > 90 ? "…" : ""}`;
@@ -1157,7 +1229,7 @@ async function handleQuestion(
     slackUser,
     slackChannel,
     runbookHits: hits,
-    duplicates,
+    duplicates: ticketIssues,
   });
   const actionId = await putAction({
     title: ticketTitle,
@@ -1179,10 +1251,11 @@ async function handleQuestion(
 
   const blocks = buildRunbookBlocks({
     summary: llmResult.summary,
+    nextActions: llmResult.next_actions,
+    recommendation: llmResult.recommendation,
     classifier: enhancedClassifier,
     runbookHits: hits,
-    duplicates,
-    duplicatesOverflow,
+    relatedTickets,
     actionId,
     threadKey: threadKeyStr,
   });
@@ -1736,94 +1809,149 @@ async function handleSearch(url: URL): Promise<Response> {
   // Extract director hint for later use
   const directorHint = "directorHint" in routeDecision ? routeDecision.directorHint : undefined;
 
-  // STEP 3: Try to get chunks (don't throw if unavailable)
   const searchStartTime = Date.now();
-  let chunks: Chunk[] = [];
-  let stale: boolean | undefined;
-  let blobAgeMs: number | undefined;
-  let noContextReason: string | undefined;
-  let indexVersion: 1 | 2 | null = null;
 
-  try {
-    const result = await buildIndex(false, { allowNotion: false });
-    chunks = result.chunks;
-    stale = result.stale;
-    blobAgeMs = result.blobAgeMs;
-    indexVersion = result.indexVersion;
-  } catch (e) {
-    noContextReason = "runbook index not available";
-    console.warn("Index not available for /search:", String((e as any)?.message || e));
+  // STEP 3: Search documents using BOTH methods:
+  // a) Try Notion direct search (semantic) - NO blob index required
+  // b) Fall back to blob index + keyword matching if available
+  let docs: Array<{
+    title: string;
+    section: string;
+    url: string;
+    score: number;
+    provenance: "semantic" | "keyword" | "both";
+  }> = [];
+  let hits: Ranked[] = [];
+  let ragUsed = false;
+  let indexVersion: 1 | 2 | null = null;
+  let searchSource: "notion_direct" | "blob_index" | "both" | "none" = "none";
+
+  // Try Notion direct search first (works from cold start, no /rebuild needed)
+  if (isNotionConfigured()) {
+    try {
+      const { results: notionResults } = await searchNotionDirect(q, 6);
+      if (notionResults.length > 0) {
+        docs = notionResults.map((r) => ({
+          title: r.chunk.pageTitle,
+          section: r.chunk.sectionTitle,
+          url: r.chunk.url,
+          score: r.score,
+          provenance: r.provenance,
+        }));
+        hits = notionResults.map(docResultToRanked);
+        ragUsed = true;
+        searchSource = "notion_direct";
+      }
+    } catch (e) {
+      console.warn("[/search] Notion direct search failed:", String((e as any)?.message || e));
+    }
   }
 
-  // STEP 4: Rank hits (if index available) - use hybrid when embeddings available
-  const { results: hits, embeddingUsed } = chunks.length > 0
-    ? await rankHybrid(q, chunks as ChunkWithEmbedding[], 5)
-    : { results: [], embeddingUsed: false };
-  const ragUsed = hits.length > 0 && hits[0].score >= RELEVANCE_SCORE_THRESHOLD;
+  // Fall back to blob index if Notion direct didn't return results
+  if (!ragUsed) {
+    try {
+      const result = await buildIndex(false, { allowNotion: false });
+      const chunks = result.chunks;
+      indexVersion = result.indexVersion;
 
-  // Log search metrics for observability
+      if (chunks.length > 0) {
+        const { results: blobHits, embeddingUsed } = await rankHybrid(q, chunks as ChunkWithEmbedding[], 5);
+        if (blobHits.length > 0 && blobHits[0].score >= RELEVANCE_SCORE_THRESHOLD) {
+          docs = blobHits.map((h) => ({
+            title: h.chunk.pageTitle,
+            section: h.chunk.sectionTitle,
+            url: h.chunk.url,
+            score: h.score,
+            provenance: embeddingUsed ? "both" as const : "keyword" as const,
+          }));
+          hits = blobHits;
+          ragUsed = true;
+          searchSource = searchSource === "notion_direct" ? "both" : "blob_index";
+        }
+      }
+    } catch (e) {
+      console.warn("[/search] Blob index not available:", String((e as any)?.message || e));
+    }
+  }
+
+  // Log search metrics
   logSearchMetrics({
     query: q,
     hits,
     ragUsed,
     indexVersion,
-    embeddingUsed,
+    embeddingUsed: searchSource === "notion_direct" || searchSource === "both",
     latencyMs: Date.now() - searchStartTime,
     source: "web",
     directorIntent: directorHint?.intent,
     directorLatencyMs,
   });
 
-  // Determine actual no-context reason
-  if (!noContextReason && !ragUsed) {
-    if (hits.length === 0) {
-      noContextReason = "no runbook matches";
-    } else {
-      noContextReason = `top score ${hits[0].score} below threshold ${RELEVANCE_SCORE_THRESHOLD}`;
-    }
+  // STEP 4: Get related tickets using LLM selection
+  let relatedTickets: Array<{
+    identifier: string;
+    title: string;
+    url: string;
+    state: string;
+    reason: string;
+  }> = [];
+
+  try {
+    const teamId = await withTimeout(
+      getLinearTeamIdByKey(LINEAR_TEAM_KEY),
+      3000,
+      "linear team lookup",
+    );
+
+    const { tickets } = await getRelatedTicketsWithLLM(q, teamId, 8000, 8);
+    relatedTickets = tickets.map((t) => ({
+      identifier: t.issue.identifier,
+      title: t.issue.title,
+      url: t.issue.url,
+      state: t.issue.state?.name || "Unknown",
+      reason: t.reason,
+    }));
+  } catch (e) {
+    console.warn("[/search] Related tickets fetch failed:", String((e as any)?.message || e));
   }
 
-  // Build response
-  const response: any = {
-    q,
-    route: "answer",
-    rag_used: ragUsed,
-    hits: hits.map((h) => ({
-      title: h.chunk.pageTitle,
-      section: h.chunk.sectionTitle,
-      url: h.chunk.url,
-      score: h.score,
-    })),
-  };
+  // STEP 5: Get LLM summary with next_actions
+  let summary = "";
+  let recommendation: "file_ticket" | "try_steps" = ragUsed ? "try_steps" : "file_ticket";
+  let nextActions: string[] = [];
+  let llmError: string | undefined;
 
-  // Include cache staleness info
-  if (stale !== undefined) {
-    response.cache_stale = stale;
-  }
-  if (blobAgeMs !== undefined) {
-    response.cache_age_sec = Math.floor(blobAgeMs / 1000);
-  }
-
-  // Always include LLM summary for /search
   try {
     const llmResult = await withTimeout(
-      llmSummarize(q, ragUsed ? hits : [], noContextReason),
+      llmSummarize(q, hits, ragUsed ? undefined : "no runbook matches"),
       LLM_SEARCH_TIMEOUT_MS,
       "llmSummarize",
     );
-    response.llm = {
-      summary: llmResult.summary,
-      recommendation: llmResult.recommendation,
-    };
+    summary = llmResult.summary;
+    recommendation = llmResult.recommendation;
+    nextActions = llmResult.next_actions || [];
   } catch (e) {
-    // Fallback on timeout/error
-    response.llm = {
-      summary: ragUsed
-        ? `Refer to "${hits[0]?.chunk.pageTitle || "runbook"}" for guidance.`
-        : "Unable to generate summary. Please provide more details.",
-      recommendation: ragUsed ? "try_steps" : "file_ticket",
-    };
-    response.llm_error = String((e as any)?.message || e);
+    llmError = String((e as any)?.message || e);
+    summary = ragUsed
+      ? `Refer to "${docs[0]?.title || "runbook"}" for guidance.`
+      : "I couldn't find specific runbook content, but I can still help. Please provide more details.";
+  }
+
+  // Build response with new structure
+  const response: any = {
+    q,
+    summary,
+    recommendation,
+    next_actions: nextActions,
+    docs,
+    related_tickets: relatedTickets,
+    // Metadata
+    search_source: searchSource,
+    latency_ms: Date.now() - searchStartTime,
+  };
+
+  if (llmError) {
+    response.llm_error = llmError;
   }
 
   return json(response);
@@ -2011,130 +2139,187 @@ async function handleSlackEvents(
 
   console.log(`[slack/events] event_id=${eventId}, channel=${channel}, thread_ts=${replyThreadTs}, isThreadReply=${isThreadReply}, question="${question.slice(0, 50)}..."`);
 
-  // Process in background (non-blocking)
-  (async () => {
-    try {
-      // DEDUPE CHECK: Skip if we've already processed this event
-      if (eventId && await seenEvent(eventId)) {
-        console.log(`[slack/events] DEDUPED: event_id=${eventId} already processed`);
-        return;
-      }
+  // DEDUPE CHECK: Do this synchronously before delegating
+  if (eventId && await seenEvent(eventId)) {
+    console.log(`[slack/events] DEDUPED: event_id=${eventId} already processed`);
+    return json({ ok: true, deduped: true });
+  }
 
-      // Mark as seen BEFORE processing to prevent double-post on crash+retry
-      if (eventId) {
-        await markEventSeen(eventId);
-        console.log(`[slack/events] Marked event_id=${eventId} as seen`);
-      }
+  // Mark as seen BEFORE processing to prevent double-post on crash+retry
+  if (eventId) {
+    await markEventSeen(eventId);
+    console.log(`[slack/events] Marked event_id=${eventId} as seen`);
+  }
 
-      // Empty question after stripping mentions
-      if (!question) {
-        await slackApi("chat.postMessage", {
-          channel,
-          thread_ts: replyThreadTs,
-          text: "Hi! I'm CS Helper. Try asking me a question like: `@cs-helper how do I handle a stuck analysis?`\n\nOr type `@cs-helper help` to see what I can do.",
+  // Use Val Town's recommended two-endpoint pattern for background processing
+  // Fire an unawaited fetch to /slack/process which keeps its own execution context alive
+  const processUrl = new URL("/slack/process", req.url).toString();
+  console.log(`[slack/events] Delegating to ${processUrl}`);
+
+  // Fire and forget - this creates a NEW request that has its own execution time
+  fetch(processUrl, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      eventId,
+      channel,
+      replyThreadTs,
+      user,
+      question,
+      isThreadReply,
+    }),
+  }).catch((e) => console.error("[slack/events] Failed to delegate:", e));
+
+  // Return immediately to Slack
+  return json({ ok: true, delegated: true });
+}
+
+/**
+ * Internal processing endpoint - called by /slack/events to do the actual work.
+ * This runs in its own execution context with full time limit.
+ */
+async function handleSlackProcess(req: Request): Promise<Response> {
+  const body = await req.json();
+  const { eventId, channel, replyThreadTs, user, question, isThreadReply } = body;
+
+  console.log(`[slack/process] Starting processing for event_id=${eventId}`);
+
+  try {
+    // Empty question after stripping mentions
+    if (!question) {
+      await slackApi("chat.postMessage", {
+        channel,
+        thread_ts: replyThreadTs,
+        text: "Hi! I'm CS Helper. Try asking me a question like: `@cs-helper how do I handle a stuck analysis?`\n\nOr type `@cs-helper help` to see what I can do.",
+      });
+      return json({ ok: true, empty_question: true });
+    }
+
+    // STEP 1: Run director BEFORE any RAG/index work
+    const { route: routeDecision } = await director(question);
+
+    // STEP 2: If help route, reply with help blocks only (no RAG)
+    if (routeDecision.route === "help") {
+      await slackApi("chat.postMessage", {
+        channel,
+        thread_ts: replyThreadTs,
+        text: "CS Helper — what I can do",
+        blocks: buildHelpBlocks(),
+      });
+      return json({ ok: true, route: "help" });
+    }
+
+    // NOTE: Early out-of-scope exit REMOVED per requirements.
+    // We now always proceed to retrieval for supportive, action-oriented responses.
+
+    // STEP 3: Check if this is a follow-up in an existing thread with saved state
+    if (isThreadReply) {
+      const existingState = await getThreadState(channel, replyThreadTs);
+      if (existingState) {
+        console.log(`[slack/process] Thread follow-up detected, using handleFollowupInThread`);
+        // This is a follow-up to an existing conversation
+        const result = await handleFollowupInThread({
+          channelId: channel,
+          threadTs: replyThreadTs,
+          user,
+          followupText: question,
         });
-        return;
-      }
 
-      // STEP 1: Run director BEFORE any RAG/index work
-      const { route: routeDecision } = await director(question);
-
-      // STEP 2: If help route, reply with help blocks only (no RAG)
-      if (routeDecision.route === "help") {
-        await slackApi("chat.postMessage", {
-          channel,
-          thread_ts: replyThreadTs,
-          text: "CS Helper — what I can do",
-          blocks: buildHelpBlocks(),
-        });
-        return;
-      }
-
-      // STEP 3: Check if this is a follow-up in an existing thread with saved state
-      if (isThreadReply) {
-        const existingState = await getThreadState(channel, replyThreadTs);
-        if (existingState) {
-          console.log(`[slack/events] Thread follow-up detected, using handleFollowupInThread`);
-          // This is a follow-up to an existing conversation
-          const result = await handleFollowupInThread({
-            channelId: channel,
-            threadTs: replyThreadTs,
-            user,
-            followupText: question,
-          });
-
-          if ("error" in result) {
-            await slackApi("chat.postMessage", {
-              channel,
-              thread_ts: replyThreadTs,
-              text: `⚠️ ${result.error}`,
-            });
-            return;
-          }
-
+        if ("error" in result) {
           await slackApi("chat.postMessage", {
             channel,
             thread_ts: replyThreadTs,
-            text: "Follow-up response",
-            blocks: result.blocks,
+            text: `⚠️ ${result.error}`,
           });
-          return;
+          return json({ ok: false, error: result.error });
         }
+
+        await slackApi("chat.postMessage", {
+          channel,
+          thread_ts: replyThreadTs,
+          text: "Follow-up response",
+          blocks: result.blocks,
+        });
+        return json({ ok: true, followup: true });
       }
+    }
 
-      // STEP 4: For new questions (or follow-ups without state), process with RAG
-      console.log(`[slack/events] Starting handleQuestion...`);
+    // STEP 4: For new questions (or follow-ups without state), process with RAG
+    console.log(`[slack/process] Starting handleQuestion...`);
 
-      // Post a "thinking" message first so user knows we're working
+    // Post a "thinking" message first so user knows we're working
+    let thinkingTs: string | undefined;
+    try {
       const thinkingMsg = await slackApi("chat.postMessage", {
         channel,
         thread_ts: replyThreadTs,
         text: "🔍 Searching runbooks and analyzing...",
       });
-      const thinkingTs = thinkingMsg?.ts;
-
-      const result = await handleQuestion(question, user, channel, {
-        includeLinear: true,
-        linearTimeoutMs: 1200,
-        threadContext: {
-          channelId: channel,
-          threadTs: replyThreadTs,
-        },
-      });
-      console.log(`[slack/events] handleQuestion complete, posting response...`);
-
-      // Update the thinking message with the actual response
-      if (thinkingTs) {
-        await slackApi("chat.update", {
-          channel,
-          ts: thinkingTs,
-          text: "CS helper response",
-          blocks: result.blocks,
-        });
-      } else {
-        // Fallback: post new message if update fails
-        await slackApi("chat.postMessage", {
-          channel,
-          thread_ts: replyThreadTs,
-          text: "CS helper response",
-          blocks: result.blocks,
-        });
-      }
-      console.log(`[slack/events] Response posted successfully`);
-    } catch (e) {
-      console.error("[slack/events] Background processing error:", e);
-      try {
-        await slackApi("chat.postMessage", {
-          channel,
-          thread_ts: replyThreadTs,
-          text: `⚠️ I hit an error answering that. Try /rebuild then ask again.\nError: ${String((e as any)?.message || e)}`,
-        });
-      } catch {}
+      thinkingTs = thinkingMsg?.ts;
+      console.log(`[slack/process] Thinking message posted: ts=${thinkingTs}`);
+    } catch (thinkErr) {
+      console.error(`[slack/process] Failed to post thinking message:`, thinkErr);
     }
-  })();
 
-  // Return fast ACK immediately
-  return ackResponse;
+    // Wrap handleQuestion in a timeout to ensure we don't hang forever
+    const HANDLE_QUESTION_TIMEOUT_MS = 50000; // 50 seconds max (we have full execution time now)
+    console.log(`[slack/process] About to call handleQuestion...`);
+    let result;
+    try {
+      result = await withTimeout(
+        handleQuestion(question, user, channel, {
+          includeLinear: true,
+          linearTimeoutMs: 1200,
+          threadContext: {
+            channelId: channel,
+            threadTs: replyThreadTs,
+          },
+        }),
+        HANDLE_QUESTION_TIMEOUT_MS,
+        "handleQuestion"
+      );
+      console.log(`[slack/process] handleQuestion complete, posting response...`);
+    } catch (handleErr) {
+      console.error(`[slack/process] handleQuestion error/timeout:`, handleErr);
+      // Post error to Slack instead of silently failing
+      await slackApi("chat.postMessage", {
+        channel,
+        thread_ts: replyThreadTs,
+        text: `⚠️ Processing timed out. Please try again or use /rebuild if this persists.\nError: ${String((handleErr as any)?.message || handleErr)}`,
+      });
+      return json({ ok: false, error: "timeout" });
+    }
+
+    // Update the thinking message with the actual response
+    if (thinkingTs) {
+      await slackApi("chat.update", {
+        channel,
+        ts: thinkingTs,
+        text: "CS helper response",
+        blocks: result.blocks,
+      });
+    } else {
+      // Fallback: post new message if update fails
+      await slackApi("chat.postMessage", {
+        channel,
+        thread_ts: replyThreadTs,
+        text: "CS helper response",
+        blocks: result.blocks,
+      });
+    }
+    console.log(`[slack/process] Response posted successfully`);
+    return json({ ok: true, processed: true });
+  } catch (e) {
+    console.error("[slack/process] Processing error:", e);
+    try {
+      await slackApi("chat.postMessage", {
+        channel,
+        thread_ts: replyThreadTs,
+        text: `⚠️ I hit an error answering that. Try /rebuild then ask again.\nError: ${String((e as any)?.message || e)}`,
+      });
+    } catch {}
+    return json({ ok: false, error: String((e as any)?.message || e) });
+  }
 }
 
 async function handleBlobDebug(): Promise<Response> {
@@ -2280,6 +2465,12 @@ export default async function handler(req: Request): Promise<Response> {
       const ok = await verifySlackSignature(req, rawBody);
       if (!ok) return text("Bad signature", 401);
       return await handleSlackEvents(req, rawBody);
+    }
+
+    // Internal processing endpoint - called by /slack/events to do background work
+    // This has its own execution context with full time limit
+    if (url.pathname === "/slack/process" && req.method === "POST") {
+      return await handleSlackProcess(req);
     }
 
     if (url.pathname === "/slack/debug-command") {

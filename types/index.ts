@@ -28,6 +28,34 @@ export type IndexPayload = {
   chunks: Chunk[];
 };
 
+// V2 index types with embeddings
+export type ChunkWithEmbedding = Chunk & {
+  embedding: number[]; // 1536 dims for text-embedding-3-small
+};
+
+export type IndexDiagnosticsV2 = {
+  embeddingModel: string | null;
+  embeddingDims: number | null;
+  chunksEmbedded: number;
+};
+
+export type IndexPayloadV2 = {
+  version: 2;
+  builtAtMs: number;
+  diag: IndexDiagnosticsV2 & Record<string, unknown>;
+  chunks: ChunkWithEmbedding[];
+};
+
+// Discriminated union for index payloads
+export type AnyIndexPayload = IndexPayload | IndexPayloadV2;
+
+/**
+ * Type guard to identify v2 index payloads
+ */
+export function isV2Index(payload: AnyIndexPayload): payload is IndexPayloadV2 {
+  return "version" in payload && payload.version === 2;
+}
+
 export type BuildOpts = {
   allowNotion?: boolean;
 };
@@ -83,6 +111,7 @@ export type HeuristicSignals = {
 export type LlmSummary = {
   summary: string;
   recommendation: "file_ticket" | "try_steps";
+  next_actions?: string[]; // 3-6 actionable bullets
 };
 
 // Follow-up entry in thread state
