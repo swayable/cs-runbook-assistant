@@ -13,9 +13,9 @@ import {
   BLOB_KEY as INDEX_BLOB_KEY,
 } from "./storage/indexStore.ts";
 import { blob as actionBlob, ACTION_BLOB_PREFIX, putAction, consumeAction } from "./storage/actionStore.ts";
-import { rank, isEngineeringOnly } from "./retrieval/rank.ts";
+import { rank } from "./retrieval/rank.ts";
 import { slackApi, verifySlackSignature } from "./slack/api.ts";
-import { retrieveAndClassify, enhanceWithLLM } from "./classifier/index.ts";
+import { classify, retrieveAndClassify, enhanceWithLLM } from "./classifier/index.ts";
 import type { ClassifierResult } from "./types/index.ts";
 
 // ============================================================================
@@ -615,25 +615,45 @@ function buildNoRelevantBlocks(args: {
   return blocks;
 }
 
-// Build Slack blocks for runbook response with LLM summary
+// Build Slack blocks for runbook response with classifier results
 function buildRunbookBlocks(args: {
   summary: string;
-  recommendation: "file_ticket" | "try_steps";
+  classifier: ClassifierResult;
   runbookHits: Ranked[];
   duplicates: LinearIssue[];
-  requiredInfo: string[];
-  engOnly: boolean;
   actionId: string;
 }): any[] {
-  const citations = args.runbookHits.length > 0
-    ? args.runbookHits
+  const { classifier } = args;
+
+  // Build classification header
+  const canHandle = classifier.can_cs_handle;
+  const classificationText = canHandle
+    ? `*CS can handle this* (${classifier.confidence} confidence)`
+    : `*Escalate to Engineering* (${classifier.confidence} confidence)`;
+
+  // Build reasons
+  const reasonsText = classifier.reasons.slice(0, 3).map((r) => `• ${r}`).join("\n");
+
+  // Build CS-safe steps (only if CS can handle)
+  const stepsText = canHandle && classifier.cs_safe_steps.length > 0
+    ? classifier.cs_safe_steps.slice(0, 5).map((s, i) => `${i + 1}. ${s}`).join("\n")
+    : null;
+
+  // Build escalation info (always show if not CS-handlable, or as backup)
+  const escalationText = classifier.escalation_info_needed.slice(0, 6).map((x) => `• ${x}`).join("\n");
+
+  // Build citations from evidence
+  const citations = classifier.evidence.length > 0
+    ? classifier.evidence
         .slice(0, 4)
-        .map((h) => {
-          const label = shortStepFromChunkText(h.chunk.text, h.chunk.pageTitle);
-          return `• <${h.chunk.url}|${h.chunk.pageTitle}> — ${label}`;
-        })
+        .map((e) => `• <${e.url}|${e.pageTitle}> — ${e.sectionTitle}`)
         .join("\n")
-    : "• (none)";
+    : args.runbookHits.length > 0
+      ? args.runbookHits
+          .slice(0, 4)
+          .map((h) => `• <${h.chunk.url}|${h.chunk.pageTitle}>`)
+          .join("\n")
+      : "• (none)";
 
   const dupText = args.duplicates.length > 0
     ? args.duplicates
@@ -642,39 +662,46 @@ function buildRunbookBlocks(args: {
         .join("\n")
     : "• None found";
 
-  const reqInfoText = args.requiredInfo.slice(0, 6).map((x) => `• ${x}`).join("\n");
-
-  const recText = args.recommendation === "file_ticket"
-    ? "This likely requires engineering help. Collect the info below and file a ticket."
-    : args.engOnly
-      ? "This looks engineering-only (DB/scripts). Review the runbook and escalate if needed."
-      : "Try the steps in the runbook. If it doesn't resolve, collect info and escalate.";
-
   const blocks: any[] = [
     {
       type: "section",
-      text: { type: "mrkdwn", text: `*Summary*\n${args.summary}` },
-    },
-    {
-      type: "section",
-      text: { type: "mrkdwn", text: `*Recommendation*\n${recText}` },
-    },
-    {
-      type: "section",
-      text: { type: "mrkdwn", text: `*Runbook sources*\n${citations}` },
-    },
-    {
-      type: "section",
-      text: { type: "mrkdwn", text: `*Possible duplicates in Linear*\n${dupText}` },
+      text: { type: "mrkdwn", text: `${classificationText}\n\n*Summary*\n${args.summary}` },
     },
   ];
 
-  if (args.recommendation === "file_ticket" || args.engOnly) {
+  // Show reasons for classification
+  if (reasonsText) {
     blocks.push({
       type: "section",
-      text: { type: "mrkdwn", text: `*Info to collect for ticket*\n${reqInfoText}` },
+      text: { type: "mrkdwn", text: `*Why?*\n${reasonsText}` },
     });
   }
+
+  // Show CS-safe steps if CS can handle
+  if (stepsText) {
+    blocks.push({
+      type: "section",
+      text: { type: "mrkdwn", text: `*Steps CS can take*\n${stepsText}` },
+    });
+  }
+
+  // Show escalation info if engineer required
+  if (!canHandle) {
+    blocks.push({
+      type: "section",
+      text: { type: "mrkdwn", text: `*Info to collect for escalation*\n${escalationText}` },
+    });
+  }
+
+  blocks.push({
+    type: "section",
+    text: { type: "mrkdwn", text: `*Runbook sources*\n${citations}` },
+  });
+
+  blocks.push({
+    type: "section",
+    text: { type: "mrkdwn", text: `*Possible duplicates in Linear*\n${dupText}` },
+  });
 
   blocks.push({
     type: "actions",
@@ -682,13 +709,13 @@ function buildRunbookBlocks(args: {
       {
         type: "button",
         text: { type: "plain_text", text: "File ENG ticket (CS Requests)" },
-        style: args.recommendation === "file_ticket" ? "primary" : undefined,
+        style: !canHandle ? "primary" : undefined,
         action_id: "create_linear_ticket",
         value: args.actionId,
       },
       {
         type: "button",
-        text: { type: "plain_text", text: "Don't file — I'll try more" },
+        text: { type: "plain_text", text: canHandle ? "Resolved — no ticket needed" : "I'll gather more info first" },
         action_id: "dismiss",
         value: "dismiss",
       },
@@ -753,9 +780,14 @@ async function answerQuestion(
   // C) Runbook response
   const hits = decision.hits;
   const hitChunks = hits.map((h) => h.chunk);
-  const engOnly = isEngineeringOnly(hitChunks);
 
-  // Get LLM summary
+  // Run the classifier on the relevant chunks
+  const classifierResult = classify(question, hitChunks);
+
+  // Optionally enhance with LLM (if API key available)
+  const enhancedClassifier = await enhanceWithLLM(question, hitChunks, classifierResult);
+
+  // Get LLM summary for the response
   const llmResult = await llmSummarize(question, hits);
 
   // Linear duplicates (optional + time-bounded)
@@ -810,15 +842,11 @@ async function answerQuestion(
     description: ticketDescription,
   });
 
-  const requiredInfo = requiredInfoList(question);
-
   const blocks = buildRunbookBlocks({
     summary: llmResult.summary,
-    recommendation: llmResult.recommendation,
+    classifier: enhancedClassifier,
     runbookHits: hits,
     duplicates,
-    requiredInfo,
-    engOnly,
     actionId,
   });
 
