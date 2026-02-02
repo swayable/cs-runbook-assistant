@@ -534,22 +534,24 @@ async function llmSummarizeFollowup(
       }).join("\n\n")
     : "NO RUNBOOK MATCHES FOUND for this query.";
 
-  const systemPrompt = `You are a CS support assistant answering a follow-up question in a conversation thread.
+  const systemPrompt = `You are a helpful CS support assistant answering a follow-up question in a conversation thread.
 
 Context:
-- The user originally asked a question about a customer issue
-- They are now asking a follow-up to clarify or dig deeper
-- Use the runbook excerpts to provide actionable guidance
+- The user originally asked about a customer issue
+- They are now asking a follow-up to clarify, dig deeper, or explore options
+- You have access to runbook excerpts (if available) AND your general knowledge
 
 Respond ONLY with valid JSON in this exact format:
 {"summary": "...", "recommendation": "try_steps" or "file_ticket"}
 
 Rules:
-- summary: 1-3 sentences answering the follow-up question. Max 600 chars.
-- Reference the runbook sources when applicable.
+- summary: 1-4 sentences answering the follow-up question thoughtfully. Max 800 chars.
+- For specific technical questions: reference runbook sources when applicable.
+- For open-ended questions (e.g., "what options do we have?", "what else could we try?"): use your knowledge of CS best practices, troubleshooting strategies, and customer communication to provide helpful suggestions.
+- Be creative and helpful - don't just say "check the runbook" if the user is asking for brainstorming or options.
 - Build on the conversation context - don't repeat basic info already covered.
-- recommendation: "try_steps" if there are actionable CS steps, "file_ticket" if it needs engineering.
-- Keep it concise and actionable.`;
+- recommendation: "try_steps" if there are actionable CS steps or suggestions, "file_ticket" only if it clearly needs engineering intervention.
+- Keep it practical and actionable.`;
 
   const userMessage = `Original question: ${rootQuestion}
 
@@ -573,14 +575,14 @@ ${contextSection}`;
 
   const parsed = safeParseJson<LlmSummary>(raw);
   if (parsed && parsed.summary && parsed.recommendation) {
-    const summary = parsed.summary.length > 600
-      ? parsed.summary.slice(0, 597) + "..."
+    const summary = parsed.summary.length > 800
+      ? parsed.summary.slice(0, 797) + "..."
       : parsed.summary;
     const rec = parsed.recommendation === "file_ticket" ? "file_ticket" : "try_steps";
     return { summary, recommendation: rec };
   }
 
-  const truncated = raw.length > 600 ? raw.slice(0, 597) + "..." : raw;
+  const truncated = raw.length > 800 ? raw.slice(0, 797) + "..." : raw;
   return { summary: truncated, recommendation: hasContext ? "try_steps" : "file_ticket" };
 }
 
