@@ -174,6 +174,88 @@ function uniqByUrlOrId(issues: LinearIssue[]): LinearIssue[] {
   return out;
 }
 
+// ============================================================================
+// Related Tickets Filtering & Selection
+// ============================================================================
+
+/** Maximum related tickets to display in Slack */
+const MAX_RELATED_TICKETS = 8;
+
+/** Minimum score to be considered "highly relevant" */
+const HIGH_RELEVANCE_SCORE = 2;
+
+/** Fallback count when no issues meet the high relevance threshold */
+const FALLBACK_TOP_N = 3;
+
+/**
+ * Filter out issues that are closed, canceled, or marked as duplicates.
+ */
+function filterRelevantOpenIssues(issues: LinearIssue[]): LinearIssue[] {
+  return issues.filter((issue) => {
+    const stateType = issue.state?.type?.toLowerCase() || "";
+    const stateName = issue.state?.name?.toLowerCase() || "";
+
+    if (stateType === "completed" || stateType === "canceled") {
+      return false;
+    }
+
+    if (stateName.includes("duplicate")) {
+      return false;
+    }
+
+    return true;
+  });
+}
+
+type ScoredIssue = { issue: LinearIssue; score: number };
+
+/**
+ * Score issues by relevance to the query.
+ */
+function scoreIssues(query: string, issues: LinearIssue[]): ScoredIssue[] {
+  const qTokens = new Set(tokenize(query));
+  return issues.map((issue) => {
+    const tTokens = tokenize(issue.title);
+    let sim = 0;
+    for (const t of tTokens) if (qTokens.has(t)) sim += 1;
+
+    const st = issue.state?.type || "";
+    let stateBoost = 0;
+    if (st === "started") stateBoost = 2;
+    if (st === "unstarted") stateBoost = 1;
+
+    return { issue, score: sim + stateBoost };
+  });
+}
+
+/**
+ * Select highly relevant open issues for display.
+ */
+function selectHighlyRelevantIssues(
+  query: string,
+  issues: LinearIssue[],
+): { selected: LinearIssue[]; overflow: number } {
+  const filtered = filterRelevantOpenIssues(issues);
+
+  if (filtered.length === 0) {
+    return { selected: [], overflow: 0 };
+  }
+
+  const scored = scoreIssues(query, filtered);
+  scored.sort((a, b) => b.score - a.score);
+
+  const highlyRelevant = scored.filter((s) => s.score >= HIGH_RELEVANCE_SCORE);
+
+  if (highlyRelevant.length > 0) {
+    const selected = highlyRelevant.slice(0, MAX_RELATED_TICKETS).map((s) => s.issue);
+    const overflow = Math.max(0, highlyRelevant.length - MAX_RELATED_TICKETS);
+    return { selected, overflow };
+  }
+
+  const selected = scored.slice(0, FALLBACK_TOP_N).map((s) => s.issue);
+  return { selected, overflow: 0 };
+}
+
 // Response construction
 function requiredInfoList(question: string): string[] {
   const q = question.toLowerCase();
@@ -312,6 +394,7 @@ function buildSlackBlocks(args: {
   requiredInfo: string[];
   runbookHits: Ranked[];
   duplicates: LinearIssue[];
+  duplicatesOverflow?: number;
   engOnly: boolean;
   actionId: string;
 }): any[] {
@@ -333,17 +416,18 @@ function buildSlackBlocks(args: {
         .join("\n")
     : "• (none)";
 
-  const dupText = args.duplicates.length > 0
-    ? args.duplicates
-        .slice(0, 3)
-        .map(
-          (d) =>
-            `• <${d.url}|${d.identifier}> — ${d.title} (${
-              d.state?.name || "Unknown"
-            })`,
-        )
-        .join("\n")
-    : "• None found";
+  // Build related tickets text (already filtered and selected upstream)
+  let dupText: string;
+  if (args.duplicates.length === 0) {
+    dupText = "• None found";
+  } else {
+    const lines = args.duplicates
+      .map((d) => `• <${d.url}|${d.identifier}> — ${d.title} (${d.state?.name || "Unknown"})`);
+    if (args.duplicatesOverflow && args.duplicatesOverflow > 0) {
+      lines.push(`• …and ${args.duplicatesOverflow} more matching ticket${args.duplicatesOverflow === 1 ? "" : "s"}`);
+    }
+    dupText = lines.join("\n");
+  }
 
   const engOnlyNote = args.engOnly
     ? "This looks engineering-only (DB/scripts/etc.). I'm not going to paraphrase those steps. Escalate with the runbook links below."
@@ -374,7 +458,7 @@ function buildSlackBlocks(args: {
       type: "section",
       text: {
         type: "mrkdwn",
-        text: `*Possible duplicates in Linear*\n${dupText}`,
+        text: `*Related tickets in Linear*\n${dupText}`,
       },
     },
     {
@@ -469,7 +553,8 @@ export async function answerQuestion(
     state: null,
   }));
 
-  let duplicates: LinearIssue[] = embeddedAsIssues;
+  let duplicates: LinearIssue[] = [];
+  let duplicatesOverflow = 0;
 
   if (includeLinear) {
     try {
@@ -485,18 +570,26 @@ export async function answerQuestion(
         "linear search",
       );
 
-      const dupRanked = rankPossibleDuplicates(question, found);
-      duplicates = uniqByUrlOrId([...embeddedAsIssues, ...dupRanked]).slice(
-        0,
-        3,
-      );
+      // Combine embedded refs with Linear search, deduplicate, then filter and select
+      const combined = uniqByUrlOrId([...embeddedAsIssues, ...found]);
+      const { selected, overflow } = selectHighlyRelevantIssues(question, combined);
+      duplicates = selected;
+      duplicatesOverflow = overflow;
     } catch (e) {
       console.warn(
         "Linear duplicate search timed out/failed:",
         String((e as any)?.message || e),
       );
-      duplicates = embeddedAsIssues;
+      // Fall back to filtered embedded refs only
+      const { selected, overflow } = selectHighlyRelevantIssues(question, embeddedAsIssues);
+      duplicates = selected;
+      duplicatesOverflow = overflow;
     }
+  } else {
+    // No Linear search, use filtered embedded refs only
+    const { selected, overflow } = selectHighlyRelevantIssues(question, embeddedAsIssues);
+    duplicates = selected;
+    duplicatesOverflow = overflow;
   }
 
   // 5) Escalation payload (stored server-side)
@@ -523,6 +616,7 @@ export async function answerQuestion(
     requiredInfo,
     runbookHits: hits,
     duplicates,
+    duplicatesOverflow,
     engOnly,
     actionId,
   });
