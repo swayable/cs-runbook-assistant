@@ -38,7 +38,8 @@ export const BLOB_MAX_AGE_MS = Number(
 // Legacy export for backward compatibility
 export const CACHE_TTL_MS = MEM_CACHE_TTL_MS;
 
-export const LINEAR_TIMEOUT_MS = Number(Deno.env.get("LINEAR_TIMEOUT_MS") || 700);
+// Linear timeout: 5s default is safer for API reliability; 700ms was too aggressive
+export const LINEAR_TIMEOUT_MS = Number(Deno.env.get("LINEAR_TIMEOUT_MS") || 5000);
 
 export const BLOB_KEY = Deno.env.get("BLOB_KEY") || "cs_runbook_index_v1";
 export const BLOB_KEY_V2 = Deno.env.get("BLOB_KEY_V2") || "cs_runbook_index_v2";

@@ -29,7 +29,7 @@ import {
   THREAD_STATE_BLOB_PREFIX,
 } from "./storage/threadStore.ts";
 import { rank, rankHybrid } from "./retrieval/rank.ts";
-import { slackApi, verifySlackSignature } from "./slack/api.ts";
+import { slackApi, verifySlackSignature, getThreadContext } from "./slack/api.ts";
 import { classify, retrieveAndClassify, enhanceWithLLM } from "./classifier/index.ts";
 import type { ClassifierResult, ThreadState, LlmSummary as LlmSummaryType, FollowupEntry, ChunkWithEmbedding } from "./types/index.ts";
 import { isV2Index } from "./types/index.ts";
@@ -47,6 +47,8 @@ import {
   buildRunbookBlocks,
   buildFollowupBlocks,
   buildTicketDescriptionWithFollowups,
+  extractLinearUrlsFromChunks,
+  type NoMatchDebugInfo,
 } from "./handlers/slackBlocks.ts";
 import {
   createLinearTicket,
@@ -90,6 +92,7 @@ type AnswerOpts = {
     channelId: string;
     threadTs: string;
   };
+  slackTicketUrls?: string[]; // Linear URLs found in Slack thread
 };
 
 type AnswerResult = {
@@ -325,7 +328,7 @@ async function director(question: string): Promise<{ route: RouteDecision; direc
 // Main Orchestration: handleQuestion
 // ============================================================================
 
-const RELEVANCE_SCORE_THRESHOLD = 2;
+const RELEVANCE_SCORE_THRESHOLD = 0.15;
 
 /**
  * Unified question handler used by both web and Slack endpoints.
@@ -429,6 +432,40 @@ async function handleQuestion(
       (finalRoute as any).reason || "no matches",
     );
 
+    // Build debug info for troubleshooting
+    const debugInfo: NoMatchDebugInfo = {
+      indexStatus: !indexAvailable ? "not_ready" : chunks.length === 0 ? "empty" : "ready",
+      chunkCount: chunks.length,
+      tokensExtracted: tokenize(question).slice(0, 10),
+      topCandidateScore: hits[0]?.score,
+      topCandidateTitle: hits[0]?.chunk?.pageTitle,
+      searchUrl: `/search?q=${encodeURIComponent(question)}&debug=1`,
+    };
+
+    // Fetch related tickets even for no-match case (helps CS find context)
+    let relatedTickets: LLMSelectedIssue[] = [];
+    const includeLinear = opts.includeLinear === true;
+
+    if (includeLinear) {
+      try {
+        const teamId = await withTimeout(
+          getLinearTeamIdByKey(LINEAR_TEAM_KEY),
+          LINEAR_TIMEOUT_MS,
+          "linear team lookup",
+        );
+        const { tickets } = await getRelatedTicketsWithLLM(
+          question,
+          teamId,
+          LINEAR_TIMEOUT_MS * 2,
+          5
+        );
+        relatedTickets = tickets;
+        console.log(`[handleQuestion] No-match case: found ${tickets.length} related tickets`);
+      } catch (e) {
+        console.warn("Linear ticket fetch failed (no-match case):", String((e as any)?.message || e));
+      }
+    }
+
     // Still create an action payload for ticket filing
     const ticketTitle = `[CS] ${question.slice(0, 90)}${question.length > 90 ? "…" : ""}`;
     const ticketDescription = buildTicketDescription({
@@ -436,7 +473,7 @@ async function handleQuestion(
       slackUser,
       slackChannel,
       runbookHits: [],
-      duplicates: [],
+      duplicates: relatedTickets.map((t) => t.issue),
     });
     const actionId = await putAction({
       title: ticketTitle,
@@ -465,6 +502,9 @@ async function handleQuestion(
         actionId,
         threadKey: threadKeyStr,
         directorHint,
+        weakHits: hits.length > 0 ? hits : undefined, // Show weak matches if any
+        relatedTickets,
+        debugInfo,
       }),
       route: finalRoute,
       llm: llmResult,
@@ -523,26 +563,11 @@ async function handleQuestion(
     }
   }
 
-  // Add runbook-embedded references as fallback
-  const embeddedRefs = uniq(hitChunks.flatMap((c) => c.ticketRefs));
-  for (const url of embeddedRefs.slice(0, 3)) {
-    // Only add if not already in relatedTickets
-    const alreadyExists = relatedTickets.some((t) => t.issue.url === url);
-    if (!alreadyExists) {
-      relatedTickets.push({
-        issue: {
-          id: `embedded-${url}`,
-          identifier: "RELATED",
-          title: "Referenced in runbook",
-          url,
-          state: null,
-        },
-        reason: "Referenced in runbook documentation",
-      });
-    }
-  }
+  // Extract embedded Linear URLs from chunks (for separate display)
+  const embeddedTicketUrls = extractLinearUrlsFromChunks(hitChunks);
+  console.log(`[handleQuestion] Found ${embeddedTicketUrls.length} embedded ticket URLs in chunks`);
 
-  // Convert relatedTickets to LinearIssue[] for buildTicketDescription (backward compat)
+  // Convert relatedTickets to LinearIssue[] for buildTicketDescription
   const ticketIssues = relatedTickets.map((t) => t.issue);
 
   // Escalation payload (stored server-side)
@@ -579,6 +604,8 @@ async function handleQuestion(
     classifier: enhancedClassifier,
     runbookHits: hits,
     relatedTickets,
+    embeddedTicketUrls,
+    slackTicketUrls: opts.slackTicketUrls, // Linear URLs from Slack thread
     actionId,
     threadKey: threadKeyStr,
   });
@@ -1079,6 +1106,11 @@ const LLM_SEARCH_TIMEOUT_MS = 12000; // 12s timeout for LLM calls in /search
 async function handleSearch(url: URL): Promise<Response> {
   const q = url.searchParams.get("q") || "";
 
+  // Query params for search options
+  const includeLinear = url.searchParams.get("includeLinear") !== "0"; // Default true
+  const summarize = url.searchParams.get("summarize") !== "0"; // Default true
+  const debug = url.searchParams.get("debug") === "1";
+
   // Follow-up mode params (for debugging without Slack)
   const threadChannel = url.searchParams.get("thread_channel");
   const threadTsParam = url.searchParams.get("thread_ts");
@@ -1133,34 +1165,22 @@ async function handleSearch(url: URL): Promise<Response> {
   const directorHint = "directorHint" in routeDecision ? routeDecision.directorHint : undefined;
 
   const searchStartTime = Date.now();
+  const tokensExtracted = tokenize(q);
 
   // STEP 3: Search documents using BOTH methods:
   // a) Try Notion direct search (semantic) - NO blob index required
   // b) Fall back to blob index + keyword matching if available
-  let docs: Array<{
-    title: string;
-    section: string;
-    url: string;
-    score: number;
-    provenance: "semantic" | "keyword" | "both";
-  }> = [];
   let hits: Ranked[] = [];
   let ragUsed = false;
   let indexVersion: 1 | 2 | null = null;
   let searchSource: "notion_direct" | "blob_index" | "both" | "none" = "none";
+  let chunkCount = 0;
 
   // Try Notion direct search first (works from cold start, no /rebuild needed)
   if (isNotionConfigured()) {
     try {
       const { results: notionResults } = await searchNotionDirect(q, 6);
       if (notionResults.length > 0) {
-        docs = notionResults.map((r) => ({
-          title: r.chunk.pageTitle,
-          section: r.chunk.sectionTitle,
-          url: r.chunk.url,
-          score: r.score,
-          provenance: r.provenance,
-        }));
         hits = notionResults.map(docResultToRanked);
         ragUsed = true;
         searchSource = "notion_direct";
@@ -1176,18 +1196,12 @@ async function handleSearch(url: URL): Promise<Response> {
       const result = await buildIndex(false, { allowNotion: false });
       const chunks = result.chunks;
       indexVersion = result.indexVersion;
+      chunkCount = chunks.length;
 
       if (chunks.length > 0) {
-        const { results: blobHits, embeddingUsed } = await rankHybrid(q, chunks as ChunkWithEmbedding[], 5);
+        const { results: blobHits, embeddingUsed } = await rankHybrid(q, chunks as ChunkWithEmbedding[], 6);
+        hits = blobHits;
         if (blobHits.length > 0 && blobHits[0].score >= RELEVANCE_SCORE_THRESHOLD) {
-          docs = blobHits.map((h) => ({
-            title: h.chunk.pageTitle,
-            section: h.chunk.sectionTitle,
-            url: h.chunk.url,
-            score: h.score,
-            provenance: embeddingUsed ? "both" as const : "keyword" as const,
-          }));
-          hits = blobHits;
           ragUsed = true;
           searchSource = searchSource === "notion_direct" ? "both" : "blob_index";
         }
@@ -1196,6 +1210,23 @@ async function handleSearch(url: URL): Promise<Response> {
       console.warn("[/search] Blob index not available:", String((e as any)?.message || e));
     }
   }
+
+  // Extract embedded Linear URLs from hit chunks
+  const hitChunks = hits.map((h) => h.chunk);
+  const embeddedTicketUrls = extractLinearUrlsFromChunks(hitChunks);
+
+  // Build detailed hits response with snippets
+  const hitsResponse = hits.map((h) => {
+    const snippet = shortStepFromChunkText(h.chunk.text, h.chunk.sectionTitle);
+    return {
+      pageTitle: h.chunk.pageTitle,
+      sectionTitle: h.chunk.sectionTitle,
+      url: h.chunk.url,
+      score: h.score,
+      snippet,
+      codeSignals: h.chunk.codeSignals,
+    };
+  });
 
   // Log search metrics
   logSearchMetrics({
@@ -1210,7 +1241,7 @@ async function handleSearch(url: URL): Promise<Response> {
     directorLatencyMs,
   });
 
-  // STEP 4: Get related tickets using LLM selection
+  // STEP 4: Get related tickets using LLM selection (if enabled)
   let relatedTickets: Array<{
     identifier: string;
     title: string;
@@ -1226,56 +1257,64 @@ async function handleSearch(url: URL): Promise<Response> {
     fallback_cause?: FallbackCause;
   } = { source: "none", fetched: 0, team: LINEAR_TEAM_KEY, error: "" };
 
-  try {
-    const teamId = await withTimeout(getLinearTeamIdByKey(LINEAR_TEAM_KEY), 3000, "team lookup");
-    const { tickets, source, issuesFetched, fallbackCause } = await getRelatedTicketsWithLLM(q, teamId, 8000, 8);
-    ticketMeta = {
-      source,
-      fetched: issuesFetched,
-      team: LINEAR_TEAM_KEY,
-      error: "",
-      fallback_cause: fallbackCause,
-    };
-    relatedTickets = tickets.map((t) => ({
-      identifier: t.issue.identifier,
-      title: t.issue.title,
-      url: t.issue.url,
-      state: t.issue.state?.name || "Unknown",
-      reason: t.reason,
-    }));
-  } catch (e) {
-    ticketMeta.error = String((e as any)?.message || e).slice(0, 100);
+  if (includeLinear) {
+    try {
+      const teamId = await withTimeout(getLinearTeamIdByKey(LINEAR_TEAM_KEY), 3000, "team lookup");
+      const { tickets, source, issuesFetched, fallbackCause } = await getRelatedTicketsWithLLM(q, teamId, 8000, 8);
+      ticketMeta = {
+        source,
+        fetched: issuesFetched,
+        team: LINEAR_TEAM_KEY,
+        error: "",
+        fallback_cause: fallbackCause,
+      };
+      relatedTickets = tickets.map((t) => ({
+        identifier: t.issue.identifier,
+        title: t.issue.title,
+        url: t.issue.url,
+        state: t.issue.state?.name || "Unknown",
+        reason: t.reason,
+      }));
+    } catch (e) {
+      ticketMeta.error = String((e as any)?.message || e).slice(0, 100);
+    }
   }
 
-  // STEP 5: Get LLM summary with next_actions
+  // STEP 5: Get LLM summary with next_actions (if enabled)
   let summary = "";
   let recommendation: "file_ticket" | "try_steps" = ragUsed ? "try_steps" : "file_ticket";
   let nextActions: string[] = [];
   let llmError: string | undefined;
 
-  try {
-    const llmResult = await withTimeout(
-      llmSummarize(q, hits, ragUsed ? undefined : "no runbook matches"),
-      LLM_SEARCH_TIMEOUT_MS,
-      "llmSummarize",
-    );
-    summary = llmResult.summary;
-    recommendation = llmResult.recommendation;
-    nextActions = llmResult.next_actions || [];
-  } catch (e) {
-    llmError = String((e as any)?.message || e);
-    summary = ragUsed
-      ? `Refer to "${docs[0]?.title || "runbook"}" for guidance.`
-      : "I couldn't find specific runbook content, but I can still help. Please provide more details.";
+  if (summarize) {
+    try {
+      const llmResult = await withTimeout(
+        llmSummarize(q, hits, ragUsed ? undefined : "no runbook matches"),
+        LLM_SEARCH_TIMEOUT_MS,
+        "llmSummarize",
+      );
+      summary = llmResult.summary;
+      recommendation = llmResult.recommendation;
+      nextActions = llmResult.next_actions || [];
+    } catch (e) {
+      llmError = String((e as any)?.message || e);
+      summary = ragUsed
+        ? `Refer to "${hitsResponse[0]?.pageTitle || "runbook"}" for guidance.`
+        : "I couldn't find specific runbook content, but I can still help. Please provide more details.";
+    }
   }
 
   // Build response with new structure
-  const response: any = {
+  const response: Record<string, unknown> = {
     q,
     summary,
     recommendation,
     next_actions: nextActions,
-    docs,
+    // Detailed hits with snippets
+    hits: hitsResponse,
+    // Embedded Linear URLs from chunks (cheap extraction)
+    embedded_ticket_urls: embeddedTicketUrls,
+    // Linear API search results (when includeLinear=1)
     related_tickets: relatedTickets,
     search_source: searchSource,
     ticket_meta: ticketMeta,
@@ -1284,6 +1323,22 @@ async function handleSearch(url: URL): Promise<Response> {
 
   if (llmError) {
     response.llm_error = llmError;
+  }
+
+  // Debug info (when debug=1)
+  if (debug) {
+    response.debug = {
+      tokens_extracted: tokensExtracted,
+      index_status: chunkCount > 0 ? "ready" : "not_ready",
+      chunk_count: chunkCount,
+      index_version: indexVersion,
+      top_candidate_score: hits[0]?.score,
+      top_candidate_title: hits[0]?.chunk?.pageTitle,
+      relevance_threshold: RELEVANCE_SCORE_THRESHOLD,
+      rag_used: ragUsed,
+      director_latency_ms: directorLatencyMs,
+      director_intent: directorHint?.intent,
+    };
   }
 
   return json(response);
@@ -1390,8 +1445,9 @@ async function handleSlackCommand(
       const thread_ts = parent.ts;
 
       // Pass thread context so follow-up button works
+      // NOTE: includeLinear enabled to show related tickets in slash command responses
       const result = await handleQuestion(question, user_name, channel_name, {
-        includeLinear: false,
+        includeLinear: true,
         threadContext: {
           channelId: channel_id,
           threadTs: thread_ts,
@@ -1579,6 +1635,18 @@ async function handleSlackProcess(req: Request): Promise<Response> {
     // STEP 4: For new questions (or follow-ups without state), process with RAG
     console.log(`[slack/process] Starting handleQuestion...`);
 
+    // Fetch thread context if this is a thread reply (for Linear URLs mentioned in thread)
+    let slackTicketUrls: string[] = [];
+    if (isThreadReply) {
+      try {
+        const threadContext = await getThreadContext(channel, replyThreadTs, 10);
+        slackTicketUrls = threadContext.linearUrls;
+        console.log(`[slack/process] Thread context: ${threadContext.messages.length} messages, ${slackTicketUrls.length} Linear URLs`);
+      } catch (e) {
+        console.warn("[slack/process] Failed to fetch thread context:", String((e as Error)?.message || e));
+      }
+    }
+
     // Post a "thinking" message first so user knows we're working
     let thinkingTs: string | undefined;
     try {
@@ -1606,6 +1674,7 @@ async function handleSlackProcess(req: Request): Promise<Response> {
             channelId: channel,
             threadTs: replyThreadTs,
           },
+          slackTicketUrls, // Pass any Linear URLs found in the thread
         }),
         HANDLE_QUESTION_TIMEOUT_MS,
         "handleQuestion"
@@ -1624,14 +1693,25 @@ async function handleSlackProcess(req: Request): Promise<Response> {
 
     // Update the thinking message with the actual response
     if (thinkingTs) {
-      await slackApi("chat.update", {
-        channel,
-        ts: thinkingTs,
-        text: "CS helper response",
-        blocks: result.blocks,
-      });
+      try {
+        await slackApi("chat.update", {
+          channel,
+          ts: thinkingTs,
+          text: "CS helper response",
+          blocks: result.blocks,
+        });
+      } catch (updateErr) {
+        // chat.update can fail if message is too old or deleted - fallback to new message
+        console.warn(`[slack/process] chat.update failed, posting new message:`, String((updateErr as Error)?.message || updateErr));
+        await slackApi("chat.postMessage", {
+          channel,
+          thread_ts: replyThreadTs,
+          text: "CS helper response",
+          blocks: result.blocks,
+        });
+      }
     } else {
-      // Fallback: post new message if update fails
+      // No thinking message - post new message
       await slackApi("chat.postMessage", {
         channel,
         thread_ts: replyThreadTs,

@@ -14,6 +14,34 @@ function uniq<T>(a: T[]): T[] {
   return Array.from(new Set(a));
 }
 
+/**
+ * Extract Linear ticket URLs from text content (runbook chunks, slack messages, etc.)
+ * Looks for URLs like: https://linear.app/team/issue/TEAM-123
+ */
+export function extractLinearUrls(text: string): string[] {
+  if (!text) return [];
+  // Match Linear URLs - handles various formats
+  const linearUrlPattern = /https?:\/\/linear\.app\/[a-z0-9-]+\/issue\/[A-Z]+-\d+[^\s)>\]"]*/gi;
+  const matches = text.match(linearUrlPattern) || [];
+  return uniq(matches);
+}
+
+/**
+ * Extract Linear ticket URLs from an array of chunks
+ */
+export function extractLinearUrlsFromChunks(chunks: Array<{ text: string; ticketRefs?: string[] }>): string[] {
+  const urls: string[] = [];
+  for (const chunk of chunks) {
+    // Get from text
+    urls.push(...extractLinearUrls(chunk.text));
+    // Get from ticketRefs if available
+    if (chunk.ticketRefs) {
+      urls.push(...chunk.ticketRefs.filter((r) => r.includes("linear.app")));
+    }
+  }
+  return uniq(urls);
+}
+
 // ============================================================================
 // Help Content Builders (CEO-friendly)
 // ============================================================================
@@ -339,6 +367,16 @@ export function buildTicketDescription(args: {
   ].join("\n");
 }
 
+// Debug info type for no-match responses
+export type NoMatchDebugInfo = {
+  indexStatus: "ready" | "not_ready" | "empty";
+  chunkCount: number;
+  tokensExtracted: string[];
+  topCandidateScore?: number;
+  topCandidateTitle?: string;
+  searchUrl?: string;
+};
+
 // Build Slack blocks for no_relevant response - SUPPORTIVE and ACTION-ORIENTED
 export function buildNoRelevantBlocks(args: {
   question: string;
@@ -348,6 +386,10 @@ export function buildNoRelevantBlocks(args: {
   actionId?: string;
   threadKey?: string; // channelId:threadTs for follow-up button
   directorHint?: DirectorDecision;
+  // New: sources and tickets
+  weakHits?: Ranked[]; // Weak matches to show even when below threshold
+  relatedTickets?: LLMSelectedIssue[]; // Related tickets from Linear
+  debugInfo?: NoMatchDebugInfo; // Debug info for troubleshooting
 }): any[] {
   // SUPPORTIVE header - never dismissive
   const headerText = "*Let me help you with this*";
@@ -379,6 +421,64 @@ export function buildNoRelevantBlocks(args: {
     });
   }
 
+  // ALWAYS show Sources section - even when empty
+  let sourcesText: string;
+  if (args.weakHits && args.weakHits.length > 0) {
+    // Show weak matches with low scores
+    sourcesText = args.weakHits
+      .slice(0, 3)
+      .map((h) => {
+        const snippet = shortStepFromChunkText(h.chunk.text, h.chunk.sectionTitle);
+        return `• <${h.chunk.url}|${h.chunk.pageTitle}> — ${h.chunk.sectionTitle}\n  _${snippet}_`;
+      })
+      .join("\n");
+    sourcesText = `*Sources* (weak matches, below threshold):\n${sourcesText}`;
+  } else {
+    // No matches at all
+    sourcesText = "*Sources:* none found";
+
+    // Add debug hints if available
+    if (args.debugInfo) {
+      const hints: string[] = [];
+      if (args.debugInfo.indexStatus === "not_ready") {
+        hints.push("• Index not ready — run `/rebuild` to build it");
+      } else if (args.debugInfo.indexStatus === "empty") {
+        hints.push("• Index is empty — run `/rebuild` to populate it");
+      }
+      if (args.debugInfo.tokensExtracted.length > 0) {
+        hints.push(`• Searched for: ${args.debugInfo.tokensExtracted.slice(0, 5).join(", ")}`);
+      }
+      if (args.debugInfo.topCandidateScore !== undefined) {
+        hints.push(`• Closest match: "${args.debugInfo.topCandidateTitle}" (score: ${args.debugInfo.topCandidateScore.toFixed(2)})`);
+      }
+      if (args.debugInfo.searchUrl) {
+        hints.push(`• Try: ${args.debugInfo.searchUrl}`);
+      }
+      if (hints.length > 0) {
+        sourcesText += "\n" + hints.join("\n");
+      }
+    }
+  }
+  blocks.push({
+    type: "section",
+    text: { type: "mrkdwn", text: sourcesText },
+  });
+
+  // ALWAYS show Related Tickets section - even when empty
+  let ticketsText: string;
+  if (args.relatedTickets && args.relatedTickets.length > 0) {
+    ticketsText = args.relatedTickets
+      .slice(0, 5)
+      .map((t) => `• <${t.issue.url}|${t.issue.identifier}> — ${t.issue.title}\n  _${t.reason}_`)
+      .join("\n");
+  } else {
+    ticketsText = "• None found in last 7 days";
+  }
+  blocks.push({
+    type: "section",
+    text: { type: "mrkdwn", text: `*Related tickets (last 7 days):*\n${ticketsText}` },
+  });
+
   // Always show info to collect (helpful for escalation)
   const reqInfoText = args.requiredInfo.slice(0, 6).map((x) => `• ${x}`).join("\n");
   blocks.push({
@@ -389,13 +489,18 @@ export function buildNoRelevantBlocks(args: {
     },
   });
 
-  // Helpful hint
+  // Helpful hint with example refined questions
+  const exampleQuestions = [
+    "analysis stuck in pending for [customer name]",
+    "finalize button missing on [test URL]",
+    "ModelPrepSyncError after adding segment",
+  ];
   blocks.push({
     type: "context",
     elements: [
       {
         type: "mrkdwn",
-        text: "💡 Include specific error messages, customer names, or feature areas for better results.",
+        text: `💡 *Tip:* Try rephrasing with specific error messages or feature areas.\n*Examples:* ${exampleQuestions.map((q) => `\`${q}\``).join(", ")}`,
       },
     ],
   });
@@ -439,6 +544,14 @@ export function buildNoRelevantBlocks(args: {
   return blocks;
 }
 
+// Ticket source type for grouping
+export type TicketSource = "runbook" | "linear" | "slack";
+
+// Extended ticket info with source
+export type TicketWithSource = LLMSelectedIssue & {
+  source: TicketSource;
+};
+
 // Build Slack blocks for runbook response with classifier results
 export function buildRunbookBlocks(args: {
   summary: string;
@@ -447,6 +560,8 @@ export function buildRunbookBlocks(args: {
   classifier: ClassifierResult;
   runbookHits: Ranked[];
   relatedTickets: LLMSelectedIssue[]; // Tickets with LLM-provided reasons
+  embeddedTicketUrls?: string[]; // Linear URLs found in runbook chunks
+  slackTicketUrls?: string[]; // Linear URLs found in Slack thread
   actionId: string;
   threadKey?: string; // channelId:threadTs for follow-up button
 }): any[] {
@@ -509,38 +624,85 @@ export function buildRunbookBlocks(args: {
     });
   }
 
-  // Build citations from evidence
-  const citations = classifier.evidence.length > 0
-    ? classifier.evidence
-        .slice(0, 4)
-        .map((e) => `• <${e.url}|${e.pageTitle}> — ${e.sectionTitle}`)
-        .join("\n")
-    : args.runbookHits.length > 0
-      ? args.runbookHits
-          .slice(0, 4)
-          .map((h) => `• <${h.chunk.url}|${h.chunk.pageTitle}>`)
-          .join("\n")
-      : "• (none)";
-
-  blocks.push({
-    type: "section",
-    text: { type: "mrkdwn", text: `*Runbook sources*\n${citations}` },
-  });
-
-  // Build related tickets text with reasons (from LLM selection)
-  let ticketText: string;
-  if (args.relatedTickets.length === 0) {
-    ticketText = "• None found in last 7 days";
-  } else {
-    ticketText = args.relatedTickets
-      .slice(0, 8)
-      .map((t) => `• <${t.issue.url}|${t.issue.identifier}> — ${t.issue.title}\n  _${t.reason}_`)
+  // Build citations from evidence OR runbook hits - WITH SNIPPETS
+  let citations: string;
+  if (classifier.evidence.length > 0) {
+    citations = classifier.evidence
+      .slice(0, 5)
+      .map((e) => {
+        const snippet = e.excerpt ? `\n  _${e.excerpt.slice(0, 100)}${e.excerpt.length > 100 ? "..." : ""}_` : "";
+        return `• <${e.url}|${e.pageTitle}> — ${e.sectionTitle}${snippet}`;
+      })
       .join("\n");
+  } else if (args.runbookHits.length > 0) {
+    citations = args.runbookHits
+      .slice(0, 5)
+      .map((h) => {
+        const snippet = shortStepFromChunkText(h.chunk.text, h.chunk.sectionTitle);
+        return `• <${h.chunk.url}|${h.chunk.pageTitle}> — ${h.chunk.sectionTitle}\n  _${snippet}_`;
+      })
+      .join("\n");
+  } else {
+    citations = "• (none found)";
   }
 
   blocks.push({
     type: "section",
-    text: { type: "mrkdwn", text: `*Related tickets (last 7 days)*\n${ticketText}` },
+    text: { type: "mrkdwn", text: `*Runbook sources:*\n${citations}` },
+  });
+
+  // Build related tickets with grouping by source
+  const ticketGroups: string[] = [];
+
+  // Group 1: Runbook-embedded Linear URLs
+  if (args.embeddedTicketUrls && args.embeddedTicketUrls.length > 0) {
+    const embeddedText = args.embeddedTicketUrls
+      .slice(0, 3)
+      .map((url) => {
+        const idMatch = url.match(/([A-Z]+-\d+)/);
+        const identifier = idMatch ? idMatch[1] : "TICKET";
+        return `• <${url}|${identifier}> _(referenced in runbook)_`;
+      })
+      .join("\n");
+    ticketGroups.push(`_From runbooks:_\n${embeddedText}`);
+  }
+
+  // Group 2: Linear API search results
+  if (args.relatedTickets.length > 0) {
+    const linearText = args.relatedTickets
+      .slice(0, 6)
+      .map((t) => {
+        const stateStr = t.issue.state?.name ? ` (${t.issue.state.name})` : "";
+        return `• <${t.issue.url}|${t.issue.identifier}>${stateStr} — ${t.issue.title}\n  _${t.reason}_`;
+      })
+      .join("\n");
+    ticketGroups.push(`_From Linear (last 7 days):_\n${linearText}`);
+  }
+
+  // Group 3: Slack thread references
+  if (args.slackTicketUrls && args.slackTicketUrls.length > 0) {
+    const slackText = args.slackTicketUrls
+      .slice(0, 3)
+      .map((url) => {
+        const idMatch = url.match(/([A-Z]+-\d+)/);
+        const identifier = idMatch ? idMatch[1] : "TICKET";
+        return `• <${url}|${identifier}> _(mentioned in thread)_`;
+      })
+      .join("\n");
+    ticketGroups.push(`_From Slack thread:_\n${slackText}`);
+  }
+
+  // Final ticket text
+  let ticketText: string;
+  if (ticketGroups.length === 0) {
+    ticketText = "• None found in last 7 days";
+  } else {
+    ticketText = ticketGroups.join("\n\n");
+  }
+
+  blocks.push({
+    type: "section",
+    text: { type: "mrkdwn", text: `*Related tickets:*\n${ticketText}` },
   });
 
   // Build action buttons
