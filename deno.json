@@ -3,7 +3,7 @@
   "lock": false,
   "tasks": {
     "dev": "deno run --allow-net --allow-env --allow-read --allow-import dev.ts",
-    "check": "deno check main.ts",
+    "check": "deno check --allow-import main.ts",
     "test": "deno test --allow-env --allow-import tests/",
     "eval": "deno run --allow-env --allow-net --allow-read scripts/eval.ts"
   },
