@@ -43,14 +43,23 @@ Respond with STRICT JSON only:
 }`;
 
 /**
- * Parse JSON from LLM response, handling markdown code blocks
+ * Parse JSON from LLM response, handling markdown code blocks and trailing text
  */
 function safeParseJson<T>(s: string): T | null {
   try {
     // Try to extract JSON from markdown code blocks if present
     const jsonMatch = s.match(/```(?:json)?\s*([\s\S]*?)```/);
-    const toParse = jsonMatch ? jsonMatch[1].trim() : s.trim();
-    return JSON.parse(toParse) as T;
+    if (jsonMatch) {
+      return JSON.parse(jsonMatch[1].trim()) as T;
+    }
+
+    // Try to extract first JSON object (model sometimes adds notes after)
+    const objectMatch = s.match(/\{[\s\S]*\}/);
+    if (objectMatch) {
+      return JSON.parse(objectMatch[0]) as T;
+    }
+
+    return JSON.parse(s.trim()) as T;
   } catch {
     return null;
   }
