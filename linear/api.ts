@@ -23,6 +23,20 @@ export type LLMSelectedIssue = {
 
 export type ScoredIssue = { issue: LinearIssue; score: number };
 
+// Fallback cause types for observability
+export type FallbackCause = "missing_key" | "timeout" | "non_200" | "parse_error" | "empty_response";
+
+// Result type for LLM selection that tracks the actual path taken
+export type TicketSelectionResult = {
+  tickets: LLMSelectedIssue[];
+  actualSource: "llm" | "keyword";
+  fallbackCause?: FallbackCause;
+  durationMs?: number;
+};
+
+// Type for injectable fetch function (for testing)
+export type FetchFn = typeof fetch;
+
 // ============================================================================
 // GraphQL Client
 // ============================================================================
@@ -199,20 +213,35 @@ const LLM_TICKET_SELECTION_TIMEOUT_MS = 8000;
 /**
  * Use LLM to select relevant tickets from a list of recent issues.
  * Returns up to maxResults tickets with a brief reason for each.
+ *
+ * @param query - The user's question/search query
+ * @param issues - List of recent Linear issues to select from
+ * @param maxResults - Maximum number of tickets to return (default 8)
+ * @param fetchFn - Optional fetch function for dependency injection (testing)
+ * @returns TicketSelectionResult with tickets, actualSource, and fallback info
  */
 export async function selectRelevantTicketsWithLLM(
   query: string,
   issues: LinearIssue[],
-  maxResults = 8
-): Promise<LLMSelectedIssue[]> {
+  maxResults = 8,
+  fetchFn: FetchFn = fetch
+): Promise<TicketSelectionResult> {
+  const startTime = Date.now();
   const apiKey = Deno.env.get("ANTHROPIC_API_KEY");
+
   if (!apiKey) {
-    console.warn("[selectRelevantTicketsWithLLM] No ANTHROPIC_API_KEY, falling back to keyword matching");
-    return fallbackKeywordSelection(query, issues, maxResults);
+    const durationMs = Date.now() - startTime;
+    logFallback("missing_key", durationMs, "No ANTHROPIC_API_KEY configured");
+    return {
+      tickets: fallbackKeywordSelection(query, issues, maxResults, "missing_key"),
+      actualSource: "keyword",
+      fallbackCause: "missing_key",
+      durationMs,
+    };
   }
 
   if (issues.length === 0) {
-    return [];
+    return { tickets: [], actualSource: "llm", durationMs: Date.now() - startTime };
   }
 
   // Prepare compact ticket data for LLM
@@ -251,7 +280,7 @@ ${ticketData.map((t) => `[${t.idx}] ${t.id}: ${t.title} (${t.state})${t.desc ? `
   const timeoutId = setTimeout(() => controller.abort(), LLM_TICKET_SELECTION_TIMEOUT_MS);
 
   try {
-    const res = await fetch("https://api.anthropic.com/v1/messages", {
+    const res = await fetchFn("https://api.anthropic.com/v1/messages", {
       method: "POST",
       headers: {
         "x-api-key": apiKey,
@@ -268,48 +297,93 @@ ${ticketData.map((t) => `[${t.idx}] ${t.id}: ${t.title} (${t.state})${t.desc ? `
     });
 
     clearTimeout(timeoutId);
+    const durationMs = Date.now() - startTime;
 
     if (!res.ok) {
-      console.error("[selectRelevantTicketsWithLLM] API error:", res.status);
-      return fallbackKeywordSelection(query, issues, maxResults);
+      logFallback("non_200", durationMs, `API returned status ${res.status}`);
+      return {
+        tickets: fallbackKeywordSelection(query, issues, maxResults, "non_200"),
+        actualSource: "keyword",
+        fallbackCause: "non_200",
+        durationMs,
+      };
     }
 
     const data = await res.json();
     const content = data?.content?.[0]?.text;
     if (!content) {
-      return fallbackKeywordSelection(query, issues, maxResults);
+      logFallback("empty_response", durationMs, "LLM returned empty content");
+      return {
+        tickets: fallbackKeywordSelection(query, issues, maxResults, "empty_response"),
+        actualSource: "keyword",
+        fallbackCause: "empty_response",
+        durationMs,
+      };
     }
 
     // Parse JSON response
     const parsed = safeParseJsonTickets(content);
     if (!parsed || !Array.isArray(parsed.selected)) {
-      console.warn("[selectRelevantTicketsWithLLM] Failed to parse LLM response");
-      return fallbackKeywordSelection(query, issues, maxResults);
+      logFallback("parse_error", durationMs, "Failed to parse LLM JSON response");
+      return {
+        tickets: fallbackKeywordSelection(query, issues, maxResults, "parse_error"),
+        actualSource: "keyword",
+        fallbackCause: "parse_error",
+        durationMs,
+      };
     }
 
-    // Map indices back to issues
+    // Map indices back to issues with LLM: prefix
     const results: LLMSelectedIssue[] = [];
     for (const sel of parsed.selected.slice(0, maxResults)) {
       const idx = sel.idx;
       if (typeof idx === "number" && idx >= 0 && idx < issues.length) {
+        const rawReason = String(sel.reason || "Related to query").slice(0, 100);
         results.push({
           issue: issues[idx],
-          reason: String(sel.reason || "Related to query").slice(0, 100),
+          reason: `LLM: ${rawReason}`,
         });
       }
     }
 
-    console.log(`[selectRelevantTicketsWithLLM] LLM selected ${results.length} tickets`);
-    return results;
+    console.log(`[selectRelevantTicketsWithLLM] LLM selected ${results.length} tickets in ${durationMs}ms`);
+    return { tickets: results, actualSource: "llm", durationMs };
   } catch (e) {
     clearTimeout(timeoutId);
+    const durationMs = Date.now() - startTime;
+
     if ((e as Error).name === "AbortError") {
-      console.warn("[selectRelevantTicketsWithLLM] Timeout, falling back to keyword");
-    } else {
-      console.error("[selectRelevantTicketsWithLLM] Error:", e);
+      logFallback("timeout", durationMs, `LLM call timed out after ${LLM_TICKET_SELECTION_TIMEOUT_MS}ms`);
+      return {
+        tickets: fallbackKeywordSelection(query, issues, maxResults, "timeout"),
+        actualSource: "keyword",
+        fallbackCause: "timeout",
+        durationMs,
+      };
     }
-    return fallbackKeywordSelection(query, issues, maxResults);
+
+    // Treat other errors as non_200 equivalent
+    logFallback("non_200", durationMs, `LLM call failed: ${String((e as Error).message || e)}`);
+    return {
+      tickets: fallbackKeywordSelection(query, issues, maxResults, "non_200"),
+      actualSource: "keyword",
+      fallbackCause: "non_200",
+      durationMs,
+    };
   }
+}
+
+/**
+ * Structured fallback logging for observability.
+ */
+function logFallback(cause: FallbackCause, durationMs: number, message: string): void {
+  console.warn(JSON.stringify({
+    event: "ticket_selection_fallback",
+    cause,
+    durationMs,
+    message,
+    timestamp: new Date().toISOString(),
+  }));
 }
 
 function safeParseJsonTickets(s: string): { selected: Array<{ idx: number; reason: string }> } | null {
@@ -324,11 +398,18 @@ function safeParseJsonTickets(s: string): { selected: Array<{ idx: number; reaso
 
 /**
  * Fallback keyword-based ticket selection when LLM is unavailable.
+ * Reasons are prefixed with "Fallback: <cause>" for observability.
+ *
+ * @param query - The user's question/search query
+ * @param issues - List of Linear issues to select from
+ * @param maxResults - Maximum number of tickets to return
+ * @param cause - The reason for falling back (used in reason prefix)
  */
-function fallbackKeywordSelection(
+export function fallbackKeywordSelection(
   query: string,
   issues: LinearIssue[],
-  maxResults: number
+  maxResults: number,
+  cause: FallbackCause = "missing_key"
 ): LLMSelectedIssue[] {
   const qTokens = new Set(tokenize(query));
   const scored = issues.map((issue) => {
@@ -344,7 +425,7 @@ function fallbackKeywordSelection(
     .slice(0, maxResults)
     .map((s) => ({
       issue: s.issue,
-      reason: "Keyword match",
+      reason: `Fallback: ${cause} - Keyword match`,
     }));
 }
 
@@ -442,16 +523,32 @@ export function selectHighlyRelevantIssues(
 // Combined: Fetch Recent + LLM Selection
 // ============================================================================
 
+// Extended result type for getRelatedTicketsWithLLM
+export type RelatedTicketsResult = {
+  tickets: LLMSelectedIssue[];
+  source: "llm" | "keyword" | "none";
+  issuesFetched: number;
+  fallbackCause?: FallbackCause;
+  selectionDurationMs?: number;
+};
+
 /**
  * Fetch recent issues from Linear (last 7 days) and use LLM to select relevant ones.
  * This is the new primary method for finding related tickets.
+ *
+ * @param query - The user's question/search query
+ * @param teamId - Linear team ID to fetch issues from
+ * @param timeoutMs - Overall timeout for fetch operation (default 10000ms)
+ * @param maxResults - Maximum number of tickets to return (default 8)
+ * @param fetchFn - Optional fetch function for dependency injection (testing)
  */
 export async function getRelatedTicketsWithLLM(
   query: string,
   teamId: string,
   timeoutMs = 10000,
-  maxResults = 8
-): Promise<{ tickets: LLMSelectedIssue[]; source: "llm" | "keyword" | "none"; issuesFetched: number }> {
+  maxResults = 8,
+  fetchFn: FetchFn = fetch
+): Promise<RelatedTicketsResult> {
   // Fetch recent issues with timeout
   let issues: LinearIssue[] = [];
   try {
@@ -474,9 +571,19 @@ export async function getRelatedTicketsWithLLM(
   }
 
   // Use LLM to select relevant tickets (with remaining time budget)
-  const tickets = await selectRelevantTicketsWithLLM(query, issues, maxResults);
-  const source = Deno.env.get("ANTHROPIC_API_KEY") ? "llm" : "keyword";
+  const result = await selectRelevantTicketsWithLLM(query, issues, maxResults, fetchFn);
 
-  console.log(`[getRelatedTicketsWithLLM] LLM/keyword selected ${tickets.length} from ${issues.length} issues`);
-  return { tickets, source, issuesFetched: issues.length };
+  console.log(
+    `[getRelatedTicketsWithLLM] ${result.actualSource} selected ${result.tickets.length} from ${issues.length} issues` +
+    (result.fallbackCause ? ` (fallback: ${result.fallbackCause})` : "") +
+    ` in ${result.durationMs}ms`
+  );
+
+  return {
+    tickets: result.tickets,
+    source: result.actualSource,
+    issuesFetched: issues.length,
+    fallbackCause: result.fallbackCause,
+    selectionDurationMs: result.durationMs,
+  };
 }

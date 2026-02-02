@@ -47,6 +47,7 @@ import {
   debugLinearTeams,
   type LinearIssue,
   type LLMSelectedIssue,
+  type FallbackCause,
 } from "./linear/api.ts";
 import { searchNotionDirect, docResultToRanked, isNotionConfigured } from "./retrieval/notionSearch.ts";
 
@@ -1187,14 +1188,17 @@ async function handleQuestion(
       );
 
       // Use new LLM-based ticket selection
-      const { tickets, source } = await getRelatedTicketsWithLLM(
+      const { tickets, source, fallbackCause } = await getRelatedTicketsWithLLM(
         question,
         teamId,
         linearTimeoutMs * 2, // Allow more time for LLM selection
         8
       );
       relatedTickets = tickets;
-      console.log(`[handleQuestion] Related tickets: ${tickets.length} (source: ${source})`);
+      console.log(
+        `[handleQuestion] Related tickets: ${tickets.length} (source: ${source}` +
+        (fallbackCause ? `, fallback: ${fallbackCause}` : "") + ")"
+      );
     } catch (e) {
       console.warn("Linear ticket fetch failed:", String((e as any)?.message || e));
       relatedTickets = [];
@@ -1896,12 +1900,24 @@ async function handleSearch(url: URL): Promise<Response> {
     state: string;
     reason: string;
   }> = [];
-  let ticketMeta = { source: "none" as "llm" | "keyword" | "none", fetched: 0, team: LINEAR_TEAM_KEY, error: "" };
+  let ticketMeta: {
+    source: "llm" | "keyword" | "none";
+    fetched: number;
+    team: string;
+    error: string;
+    fallback_cause?: FallbackCause;
+  } = { source: "none", fetched: 0, team: LINEAR_TEAM_KEY, error: "" };
 
   try {
     const teamId = await withTimeout(getLinearTeamIdByKey(LINEAR_TEAM_KEY), 3000, "team lookup");
-    const { tickets, source, issuesFetched } = await getRelatedTicketsWithLLM(q, teamId, 8000, 8);
-    ticketMeta = { source, fetched: issuesFetched, team: LINEAR_TEAM_KEY, error: "" };
+    const { tickets, source, issuesFetched, fallbackCause } = await getRelatedTicketsWithLLM(q, teamId, 8000, 8);
+    ticketMeta = {
+      source,
+      fetched: issuesFetched,
+      team: LINEAR_TEAM_KEY,
+      error: "",
+      fallback_cause: fallbackCause,
+    };
     relatedTickets = tickets.map((t) => ({
       identifier: t.issue.identifier,
       title: t.issue.title,
