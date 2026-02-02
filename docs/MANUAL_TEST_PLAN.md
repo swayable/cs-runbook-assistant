@@ -18,6 +18,35 @@ This document describes manual tests for verifying the CS Helper bot changes:
 
 2. Type check passes: `deno check main.ts`
 
+3. Automated tests pass: `deno test --allow-env --allow-import tests/`
+
+---
+
+## Automated Tests (Run Locally)
+
+Before manual testing, verify all automated tests pass:
+
+```bash
+export PATH="/mnt/a61cc0e8-1b32-4574-a771-4ad77e8faab6/conda/.deno/bin:$PATH"
+deno test --allow-env --allow-import tests/
+```
+
+**Test files:**
+- `tests/relatedTickets.test.ts` - Legacy keyword selection tests (10 tests)
+- `tests/ticket_selection_llm.test.ts` - LLM ticket selection tests (13 tests)
+
+**LLM ticket selection tests cover:**
+- [ ] LLM path returns `LLM:` prefixed reasons
+- [ ] LLM response determines ticket selection (not keywords)
+- [ ] HTTP call targets Anthropic API endpoint
+- [ ] Fallback on missing API key (`missing_key`)
+- [ ] Fallback on LLM timeout (`timeout`)
+- [ ] Fallback on API error (`non_200`)
+- [ ] Fallback on invalid JSON (`parse_error`)
+- [ ] Fallback on empty response (`empty_response`)
+- [ ] All fallbacks use `Fallback:` prefixed reasons
+- [ ] Duration tracking in results
+
 ---
 
 ## Web Endpoint Tests
@@ -205,11 +234,43 @@ curl "https://swayable--fd813c40fef411f088c442dde27851f2.web.val.run/search?q=cu
 - [ ] Reasons are 5-15 words each
 - [ ] Unrelated tickets are not included
 
+### Test 15: LLM Ticket Selection - Verify LLM Path
+```bash
+curl "https://swayable--fd813c40fef411f088c442dde27851f2.web.val.run/search?q=analysis+pending" | jq '{ticket_meta, reasons: [.related_tickets[].reason]}'
+```
+
+**Verify:**
+- [ ] `ticket_meta.source` is `"llm"` (not `"keyword"`)
+- [ ] `ticket_meta.fallback_cause` is absent or `null`
+- [ ] All `related_tickets[].reason` values start with `LLM:`
+- [ ] Reasons contain semantic explanations (not just "Keyword match")
+
+**If source is "keyword" instead:**
+1. Check Val Town env has `ANTHROPIC_API_KEY` set
+2. Check logs for `ticket_selection_fallback` events
+3. Common causes:
+   - `missing_key`: ANTHROPIC_API_KEY not configured
+   - `timeout`: LLM call took >8s
+   - `non_200`: Anthropic API returned error
+   - `parse_error`: LLM response wasn't valid JSON
+
+### Test 16: LLM Ticket Selection - Fallback Behavior
+Temporarily remove `ANTHROPIC_API_KEY` from Val Town env:
+```bash
+curl "https://swayable--fd813c40fef411f088c442dde27851f2.web.val.run/search?q=tracker+backfill" | jq '{ticket_meta, reasons: [.related_tickets[].reason]}'
+```
+
+**Verify:**
+- [ ] `ticket_meta.source` is `"keyword"`
+- [ ] `ticket_meta.fallback_cause` is `"missing_key"`
+- [ ] All `related_tickets[].reason` values start with `Fallback:`
+- [ ] Reasons include the cause, e.g., `"Fallback: missing_key - Keyword match"`
+
 ---
 
 ## Edge Cases
 
-### Test 15: Empty Query
+### Test 17: Empty Query
 ```bash
 curl "https://swayable--fd813c40fef411f088c442dde27851f2.web.val.run/search?q="
 ```
@@ -218,7 +279,7 @@ curl "https://swayable--fd813c40fef411f088c442dde27851f2.web.val.run/search?q="
 - [ ] Returns help response
 - [ ] Does not error
 
-### Test 16: Very Long Query
+### Test 18: Very Long Query
 ```bash
 curl "https://swayable--fd813c40fef411f088c442dde27851f2.web.val.run/search?q=..." (500+ characters)
 ```
@@ -228,15 +289,15 @@ curl "https://swayable--fd813c40fef411f088c442dde27851f2.web.val.run/search?q=..
 - [ ] Response is generated
 - [ ] No timeout or error
 
-### Test 17: API Key Missing (Degraded Mode)
+### Test 19: API Key Missing (Degraded Mode)
 Temporarily remove `ANTHROPIC_API_KEY`
 
 **Verify:**
 - [ ] Keyword-only search still works
-- [ ] Ticket selection falls back to keyword matching
+- [ ] Ticket selection falls back to keyword matching with `Fallback:` prefix
 - [ ] Response includes fallback summary
 
-### Test 18: Linear API Failure
+### Test 20: Linear API Failure
 Temporarily set invalid `LINEAR_API_KEY`
 
 **Verify:**
@@ -244,7 +305,7 @@ Temporarily set invalid `LINEAR_API_KEY`
 - [ ] Error is logged but not shown to user
 - [ ] Response includes runbook results
 
-### Test 19: Notion API Failure
+### Test 21: Notion API Failure
 Temporarily set invalid `NOTION_TOKEN`
 
 **Verify:**
@@ -270,4 +331,23 @@ All tests above should pass for the changes to be considered complete:
 - [ ] Web endpoint tests (1-5) pass
 - [ ] Slack integration tests (6-11) pass
 - [ ] Ticket selection tests (12-14) pass
-- [ ] Edge cases (15-19) handled gracefully
+- [ ] LLM ticket selection verification (15-16) pass
+- [ ] Edge cases (17-21) handled gracefully
+
+## Environment Variables for LLM Ticket Selection
+
+To enable LLM-based ticket selection in Val Town:
+
+| Variable | Required | Description |
+|----------|----------|-------------|
+| `ANTHROPIC_API_KEY` | Yes | Enables LLM ticket selection. Without this, falls back to keyword matching. |
+| `LLM_TICKET_MODEL` | No | Claude model for ticket selection (default: `claude-3-5-haiku-20241022`) |
+
+**Verification:** When LLM is working correctly:
+- `ticket_meta.source` = `"llm"`
+- `related_tickets[].reason` starts with `"LLM:"`
+
+**Fallback indicators:**
+- `ticket_meta.source` = `"keyword"`
+- `ticket_meta.fallback_cause` = cause code (`missing_key`, `timeout`, `non_200`, `parse_error`, `empty_response`)
+- `related_tickets[].reason` starts with `"Fallback: <cause>"`
