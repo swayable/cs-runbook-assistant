@@ -32,7 +32,7 @@
 // cheap and fast. The /rebuild endpoint crawls Notion and updates the blob.
 // ============================================================================
 
-import { mustEnv, BLOB_KEY, LINEAR_API_KEY, LINEAR_TEAM_KEY, LINEAR_LABEL_NAME, LINEAR_TIMEOUT_MS, BLOB_MAX_AGE_MS } from "./env.ts";
+import { mustEnv, BLOB_KEY, LINEAR_API_KEY, LINEAR_TEAM_KEY, LINEAR_LABEL_NAME, LINEAR_TIMEOUT_MS, BLOB_MAX_AGE_MS, MAX_FOLLOWUPS } from "./env.ts";
 import { json, text } from "./util/response.ts";
 import {
   buildIndex,
@@ -42,10 +42,20 @@ import {
   BLOB_KEY as INDEX_BLOB_KEY,
 } from "./storage/indexStore.ts";
 import { blob as actionBlob, ACTION_BLOB_PREFIX, putAction, consumeAction } from "./storage/actionStore.ts";
+import {
+  threadKey,
+  getThreadState,
+  putThreadState,
+  createOrUpdateThreadState,
+  addFollowup,
+  expireThreadStates,
+  blob as threadBlob,
+  THREAD_STATE_BLOB_PREFIX,
+} from "./storage/threadStore.ts";
 import { rank } from "./retrieval/rank.ts";
 import { slackApi, verifySlackSignature } from "./slack/api.ts";
 import { classify, retrieveAndClassify, enhanceWithLLM } from "./classifier/index.ts";
-import type { ClassifierResult } from "./types/index.ts";
+import type { ClassifierResult, ThreadState, LlmSummary as LlmSummaryType, FollowupEntry } from "./types/index.ts";
 
 // ============================================================================
 // Types
@@ -88,6 +98,10 @@ type LlmSummary = {
 type AnswerOpts = {
   includeLinear?: boolean;
   linearTimeoutMs?: number;
+  threadContext?: {
+    channelId: string;
+    threadTs: string;
+  };
 };
 
 type AnswerResult = {
@@ -309,6 +323,71 @@ function buildHelpBlocks(): any[] {
 }
 
 // ============================================================================
+// Slack Modal Builder (for follow-up input)
+// ============================================================================
+
+/**
+ * Build a Slack modal for follow-up question input.
+ * @param channelId - The channel ID for thread context
+ * @param threadTs - The thread timestamp for context
+ * @returns Modal view object for Slack views.open
+ */
+function buildFollowupModal(channelId: string, threadTs: string): any {
+  return {
+    type: "modal",
+    callback_id: "followup_modal_submit",
+    private_metadata: JSON.stringify({ channelId, threadTs }),
+    title: {
+      type: "plain_text",
+      text: "Ask a follow-up",
+    },
+    submit: {
+      type: "plain_text",
+      text: "Send",
+    },
+    close: {
+      type: "plain_text",
+      text: "Cancel",
+    },
+    blocks: [
+      {
+        type: "section",
+        text: {
+          type: "mrkdwn",
+          text: "Ask a follow-up question about this issue. I'll search the same runbooks and provide additional guidance.",
+        },
+      },
+      {
+        type: "input",
+        block_id: "followup_input_block",
+        element: {
+          type: "plain_text_input",
+          action_id: "followup_text",
+          multiline: true,
+          placeholder: {
+            type: "plain_text",
+            text: "e.g., What if the customer already tried refreshing? How do I check the diagnostics page?",
+          },
+        },
+        label: {
+          type: "plain_text",
+          text: "Follow-up question",
+        },
+      },
+      {
+        type: "context",
+        elements: [
+          {
+            type: "mrkdwn",
+            text: "💡 *Tip:* Be specific about what you need clarification on. Include error messages or symptoms if relevant.",
+          },
+        ],
+      },
+    ],
+  };
+}
+
+// ============================================================================
 // LLM Functions (Anthropic)
 // ============================================================================
 
@@ -436,6 +515,96 @@ Rules:
   }
 
   // Parse failed - extract summary from raw text
+  const truncated = raw.length > 600 ? raw.slice(0, 597) + "..." : raw;
+  return { summary: truncated, recommendation: hasContext ? "try_steps" : "file_ticket" };
+}
+
+/**
+ * LLM summarize for follow-up questions.
+ * Includes conversation history and previous context.
+ */
+async function llmSummarizeFollowup(
+  rootQuestion: string,
+  followups: FollowupEntry[],
+  currentFollowup: string,
+  hits: Ranked[],
+): Promise<LlmSummary> {
+  const hasContext = hits.length > 0;
+
+  // Fallback if no API key
+  if (!Deno.env.get("ANTHROPIC_API_KEY")) {
+    if (hasContext) {
+      return {
+        summary: `Based on the "${hits[0].chunk.pageTitle}" runbook, here's what I found for your follow-up.`,
+        recommendation: "try_steps",
+      };
+    }
+    return {
+      summary: "I couldn't find specific runbook content for your follow-up question.",
+      recommendation: "file_ticket",
+    };
+  }
+
+  // Build conversation history (last 3 follow-ups max)
+  const recentFollowups = followups.slice(-3);
+  const historySection = recentFollowups.length > 0
+    ? recentFollowups.map((f, i) => `[Follow-up ${i + 1}]: ${f.text}`).join("\n")
+    : "(no previous follow-ups)";
+
+  // Build context from top hits
+  const contextSection = hasContext
+    ? hits.slice(0, 3).map((h, i) => {
+        const excerpt = h.chunk.text.slice(0, 400).replaceAll("\n", " ");
+        return `[${i + 1}] Title: ${h.chunk.pageTitle} | Section: ${h.chunk.sectionTitle}\nExcerpt: ${excerpt}`;
+      }).join("\n\n")
+    : "NO RUNBOOK MATCHES FOUND for this query.";
+
+  const systemPrompt = `You are a CS support assistant answering a follow-up question in a conversation thread.
+
+Context:
+- The user originally asked a question about a customer issue
+- They are now asking a follow-up to clarify or dig deeper
+- Use the runbook excerpts to provide actionable guidance
+
+Respond ONLY with valid JSON in this exact format:
+{"summary": "...", "recommendation": "try_steps" or "file_ticket"}
+
+Rules:
+- summary: 1-3 sentences answering the follow-up question. Max 600 chars.
+- Reference the runbook sources when applicable.
+- Build on the conversation context - don't repeat basic info already covered.
+- recommendation: "try_steps" if there are actionable CS steps, "file_ticket" if it needs engineering.
+- Keep it concise and actionable.`;
+
+  const userMessage = `Original question: ${rootQuestion}
+
+Previous follow-ups:
+${historySection}
+
+Current follow-up question: ${currentFollowup}
+
+Runbook context:
+${contextSection}`;
+
+  const raw = await callAnthropic(systemPrompt, userMessage);
+  if (!raw) {
+    return {
+      summary: hasContext
+        ? `Refer to "${hits[0]?.chunk.pageTitle || "runbook"}" for more details.`
+        : "Unable to generate follow-up response.",
+      recommendation: hasContext ? "try_steps" : "file_ticket",
+    };
+  }
+
+  const parsed = safeParseJson<LlmSummary>(raw);
+  if (parsed && parsed.summary && parsed.recommendation) {
+    const summary = parsed.summary.length > 600
+      ? parsed.summary.slice(0, 597) + "..."
+      : parsed.summary;
+    const rec = parsed.recommendation === "file_ticket" ? "file_ticket" : "try_steps";
+    return { summary, recommendation: rec };
+  }
+
   const truncated = raw.length > 600 ? raw.slice(0, 597) + "..." : raw;
   return { summary: truncated, recommendation: hasContext ? "try_steps" : "file_ticket" };
 }
@@ -686,6 +855,7 @@ function buildNoRelevantBlocks(args: {
   requiredInfo: string[];
   llmSummary?: string;
   actionId?: string;
+  threadKey?: string; // channelId:threadTs for follow-up button
 }): any[] {
   const reqInfoText = args.requiredInfo.slice(0, 6).map((x) => `• ${x}`).join("\n");
 
@@ -710,24 +880,40 @@ function buildNoRelevantBlocks(args: {
     },
   ];
 
+  // Build action buttons
+  const actionElements: any[] = [];
+
+  // Add follow-up button if threadKey is provided
+  if (args.threadKey) {
+    actionElements.push({
+      type: "button",
+      text: { type: "plain_text", text: "Ask a follow-up" },
+      action_id: "ask_followup",
+      value: args.threadKey,
+    });
+  }
+
   if (args.actionId) {
+    actionElements.push({
+      type: "button",
+      text: { type: "plain_text", text: "File ENG ticket (CS Requests)" },
+      style: "primary",
+      action_id: "create_linear_ticket",
+      value: args.actionId,
+    });
+  }
+
+  actionElements.push({
+    type: "button",
+    text: { type: "plain_text", text: "Dismiss" },
+    action_id: "dismiss",
+    value: "dismiss",
+  });
+
+  if (actionElements.length > 0) {
     blocks.push({
       type: "actions",
-      elements: [
-        {
-          type: "button",
-          text: { type: "plain_text", text: "File ENG ticket (CS Requests)" },
-          style: "primary",
-          action_id: "create_linear_ticket",
-          value: args.actionId,
-        },
-        {
-          type: "button",
-          text: { type: "plain_text", text: "I'll add more context" },
-          action_id: "dismiss",
-          value: "dismiss",
-        },
-      ],
+      elements: actionElements,
     });
   }
 
@@ -741,6 +927,7 @@ function buildRunbookBlocks(args: {
   runbookHits: Ranked[];
   duplicates: LinearIssue[];
   actionId: string;
+  threadKey?: string; // channelId:threadTs for follow-up button
 }): any[] {
   const { classifier } = args;
 
@@ -822,26 +1009,169 @@ function buildRunbookBlocks(args: {
     text: { type: "mrkdwn", text: `*Possible duplicates in Linear*\n${dupText}` },
   });
 
+  // Build action buttons
+  const actionElements: any[] = [];
+
+  // Add follow-up button first if threadKey is provided
+  if (args.threadKey) {
+    actionElements.push({
+      type: "button",
+      text: { type: "plain_text", text: "Ask a follow-up" },
+      action_id: "ask_followup",
+      value: args.threadKey,
+    });
+  }
+
+  // Add file ticket button (primary if engineer required)
+  actionElements.push({
+    type: "button",
+    text: { type: "plain_text", text: "File ENG ticket (CS Requests)" },
+    style: !canHandle ? "primary" : undefined,
+    action_id: "create_linear_ticket",
+    value: args.actionId,
+  });
+
+  // Add dismiss button
+  actionElements.push({
+    type: "button",
+    text: { type: "plain_text", text: canHandle ? "Resolved — no ticket needed" : "Dismiss" },
+    action_id: "dismiss",
+    value: "dismiss",
+  });
+
   blocks.push({
     type: "actions",
-    elements: [
-      {
-        type: "button",
-        text: { type: "plain_text", text: "File ENG ticket (CS Requests)" },
-        style: !canHandle ? "primary" : undefined,
-        action_id: "create_linear_ticket",
-        value: args.actionId,
-      },
-      {
-        type: "button",
-        text: { type: "plain_text", text: canHandle ? "Resolved — no ticket needed" : "I'll gather more info first" },
-        action_id: "dismiss",
-        value: "dismiss",
-      },
-    ],
+    elements: actionElements,
   });
 
   return blocks;
+}
+
+// Build Slack blocks for follow-up response
+function buildFollowupBlocks(args: {
+  followupQuestion: string;
+  summary: string;
+  recommendation: "file_ticket" | "try_steps";
+  runbookHits: Ranked[];
+  actionId: string;
+  threadKey: string;
+}): any[] {
+  const citations = args.runbookHits.length > 0
+    ? args.runbookHits
+        .slice(0, 3)
+        .map((h) => `• <${h.chunk.url}|${h.chunk.pageTitle}>`)
+        .join("\n")
+    : "• (none found)";
+
+  const blocks: any[] = [
+    {
+      type: "section",
+      text: {
+        type: "mrkdwn",
+        text: `*Follow-up:* ${args.followupQuestion}\n\n*Answer*\n${args.summary}`,
+      },
+    },
+    {
+      type: "section",
+      text: {
+        type: "mrkdwn",
+        text: `*Runbook sources*\n${citations}`,
+      },
+    },
+  ];
+
+  // Build action buttons
+  const actionElements: any[] = [
+    {
+      type: "button",
+      text: { type: "plain_text", text: "Ask another follow-up" },
+      action_id: "ask_followup",
+      value: args.threadKey,
+    },
+  ];
+
+  // Only show file ticket button if recommendation is file_ticket
+  if (args.recommendation === "file_ticket") {
+    actionElements.push({
+      type: "button",
+      text: { type: "plain_text", text: "File ENG ticket" },
+      style: "primary",
+      action_id: "create_linear_ticket",
+      value: args.actionId,
+    });
+  }
+
+  actionElements.push({
+    type: "button",
+    text: { type: "plain_text", text: "Done" },
+    action_id: "dismiss",
+    value: "dismiss",
+  });
+
+  blocks.push({
+    type: "actions",
+    elements: actionElements,
+  });
+
+  return blocks;
+}
+
+// Build ticket description with follow-up history
+function buildTicketDescriptionWithFollowups(args: {
+  question: string;
+  slackUser?: string;
+  slackChannel?: string;
+  runbookHits: Ranked[];
+  duplicates: LinearIssue[];
+  followups: FollowupEntry[];
+  lastSummary: string;
+}): string {
+  const runbookLines = args.runbookHits.length > 0
+    ? args.runbookHits
+        .map((h, i) => {
+          const label = shortStepFromChunkText(h.chunk.text, h.chunk.pageTitle);
+          return `${i + 1}. ${h.chunk.pageTitle} — ${h.chunk.sectionTitle}\n   ${h.chunk.url}\n   Step label: ${label}\n   score=${h.score} codeSignals=${h.chunk.codeSignals}`;
+        })
+        .join("\n")
+    : "(none)";
+
+  const dupLines = args.duplicates.length > 0
+    ? args.duplicates
+        .map((d) => `- ${d.identifier} — ${d.title} (${d.state?.name || "Unknown"})\n  ${d.url}`)
+        .join("\n")
+    : "(none found)";
+
+  // Build follow-up conversation trail
+  const followupLines = args.followups.length > 0
+    ? args.followups.map((f, i) =>
+        `**Follow-up ${i + 1}** (by ${f.user} at ${new Date(f.ts).toISOString()}):\n${f.text}`
+      ).join("\n\n")
+    : "(none)";
+
+  return [
+    "## CS Escalation",
+    "",
+    `**Slack user:** ${args.slackUser || "unknown"}`,
+    `**Slack channel:** ${args.slackChannel || "unknown"}`,
+    "",
+    "### Original Question",
+    args.question,
+    "",
+    "### Follow-up Conversation",
+    followupLines,
+    "",
+    "### Bot Summary",
+    args.lastSummary,
+    "",
+    "### Runbook pointers (what the bot found)",
+    runbookLines,
+    "",
+    "### Possible duplicates",
+    dupLines,
+    "",
+    "### Required info checklist",
+    requiredInfoList(args.question).map((x) => `- [ ] ${x}`).join("\n"),
+  ].join("\n");
 }
 
 // ============================================================================
@@ -860,6 +1190,11 @@ async function handleQuestion(
   slackChannel?: string,
   opts: AnswerOpts = {},
 ): Promise<AnswerResult> {
+  // Build thread key for follow-up button if thread context is provided
+  const threadKeyStr = opts.threadContext
+    ? `${opts.threadContext.channelId}:${opts.threadContext.threadTs}`
+    : undefined;
+
   // STEP 1: Run director BEFORE any RAG/index work
   const routeDecision = await director(question);
 
@@ -933,12 +1268,26 @@ async function handleQuestion(
       description: ticketDescription,
     });
 
+    // Save thread state if thread context provided
+    if (opts.threadContext) {
+      await createOrUpdateThreadState({
+        channelId: opts.threadContext.channelId,
+        threadTs: opts.threadContext.threadTs,
+        rootQuestion: question,
+        rootUser: slackUser || "unknown",
+        hits: [],
+        llm: llmResult,
+        ticketDraft: ticketDescription,
+      });
+    }
+
     return {
       blocks: buildNoRelevantBlocks({
         question,
         requiredInfo,
         llmSummary: llmResult.summary,
         actionId,
+        threadKey: threadKeyStr,
       }),
       route: finalRoute,
       llm: llmResult,
@@ -1011,12 +1360,26 @@ async function handleQuestion(
     description: ticketDescription,
   });
 
+  // Save thread state if thread context provided
+  if (opts.threadContext) {
+    await createOrUpdateThreadState({
+      channelId: opts.threadContext.channelId,
+      threadTs: opts.threadContext.threadTs,
+      rootQuestion: question,
+      rootUser: slackUser || "unknown",
+      hits: hits,
+      llm: llmResult,
+      ticketDraft: ticketDescription,
+    });
+  }
+
   const blocks = buildRunbookBlocks({
     summary: llmResult.summary,
     classifier: enhancedClassifier,
     runbookHits: hits,
     duplicates,
     actionId,
+    threadKey: threadKeyStr,
   });
 
   return {
@@ -1029,8 +1392,119 @@ async function handleQuestion(
 }
 
 // ============================================================================
+// Handle Follow-up Questions in Thread
+// ============================================================================
+
+const LLM_FOLLOWUP_TIMEOUT_MS = 8000; // 8s timeout for follow-up LLM calls
+
+/**
+ * Handle a follow-up question within an existing thread.
+ * Loads thread state, runs RAG with combined context, and posts response.
+ */
+async function handleFollowupInThread(params: {
+  channelId: string;
+  threadTs: string;
+  user: string;
+  followupText: string;
+}): Promise<{ blocks: any[]; llm: LlmSummary; actionId: string } | { error: string }> {
+  const { channelId, threadTs, user, followupText } = params;
+
+  // Load existing thread state
+  const state = await getThreadState(channelId, threadTs);
+  if (!state) {
+    return {
+      error: "Thread context expired or not found. Please start a new question.",
+    };
+  }
+
+  // Check if this is a help query
+  if (isHelpQuery(followupText)) {
+    return {
+      blocks: buildHelpBlocks(),
+      llm: { summary: "Help information", recommendation: "try_steps" },
+      actionId: "",
+    };
+  }
+
+  // Try to load index for RAG
+  let chunks: Chunk[] = [];
+  try {
+    const result = await buildIndex(false, { allowNotion: false });
+    chunks = result.chunks;
+  } catch (e) {
+    console.warn("Index not available for follow-up:", String((e as any)?.message || e));
+  }
+
+  // Combine root question + follow-up for ranking
+  const combinedQuery = `${state.rootQuestion} ${followupText}`;
+  const hits = chunks.length > 0 ? rank(combinedQuery, chunks, 5) : state.lastHits;
+
+  // Get LLM summary for follow-up
+  let llmResult: LlmSummary;
+  try {
+    llmResult = await withTimeout(
+      llmSummarizeFollowup(state.rootQuestion, state.followups, followupText, hits),
+      LLM_FOLLOWUP_TIMEOUT_MS,
+      "llmSummarizeFollowup",
+    );
+  } catch (e) {
+    console.warn("LLM follow-up timeout:", String((e as any)?.message || e));
+    llmResult = {
+      summary: hits.length > 0
+        ? `Check "${hits[0].chunk.pageTitle}" for more details on your follow-up question.`
+        : "I couldn't generate a follow-up response. Please try rephrasing your question.",
+      recommendation: hits.length > 0 ? "try_steps" : "file_ticket",
+    };
+  }
+
+  // Build updated ticket draft with follow-up history
+  const newFollowup: FollowupEntry = {
+    user,
+    text: followupText,
+    ts: Date.now(),
+  };
+
+  const updatedFollowups = [...state.followups, newFollowup].slice(-MAX_FOLLOWUPS);
+
+  const ticketDraft = buildTicketDescriptionWithFollowups({
+    question: state.rootQuestion,
+    slackUser: state.rootUser,
+    slackChannel: channelId,
+    runbookHits: hits,
+    duplicates: [],
+    followups: updatedFollowups,
+    lastSummary: llmResult.summary,
+  });
+
+  // Create action payload for ticket
+  const ticketTitle = `[CS] ${state.rootQuestion.slice(0, 90)}${state.rootQuestion.length > 90 ? "…" : ""}`;
+  const actionId = await putAction({
+    title: ticketTitle,
+    description: ticketDraft,
+  });
+
+  // Update thread state
+  await addFollowup(channelId, threadTs, newFollowup, hits, llmResult, ticketDraft);
+
+  // Build response blocks
+  const threadKeyStr = `${channelId}:${threadTs}`;
+  const blocks = buildFollowupBlocks({
+    followupQuestion: followupText,
+    summary: llmResult.summary,
+    recommendation: llmResult.recommendation,
+    runbookHits: hits,
+    actionId,
+    threadKey: threadKeyStr,
+  });
+
+  return { blocks, llm: llmResult, actionId };
+}
+
+// ============================================================================
 // Slack Actions Handler
 // ============================================================================
+
+const SLACK_API_TIMEOUT_MS = 2500; // 2.5s timeout for Slack API calls
 
 async function handleSlackActions(
   _req: Request,
@@ -1041,35 +1515,88 @@ async function handleSlackActions(
   if (!payloadStr) return json({ ok: false, error: "Missing payload" }, 400);
 
   const payload = JSON.parse(payloadStr);
+
+  // Handle modal submission (view_submission)
+  if (payload.type === "view_submission") {
+    return await handleModalSubmission(payload);
+  }
+
+  // Handle button actions (block_actions)
   const action = payload.actions?.[0];
   if (!action) return json({ ok: true });
 
   const channelId = payload.channel?.id;
   const messageTs = payload.message?.ts;
   const threadTs = payload.message?.thread_ts || messageTs;
+  const triggerId = payload.trigger_id;
 
   const postThread = async (textMsg: string) => {
     if (!channelId || !threadTs) return;
-    await slackApi("chat.postMessage", {
-      channel: channelId,
-      thread_ts: threadTs,
-      text: textMsg,
-    });
+    try {
+      await withTimeout(
+        slackApi("chat.postMessage", {
+          channel: channelId,
+          thread_ts: threadTs,
+          text: textMsg,
+        }),
+        SLACK_API_TIMEOUT_MS,
+        "postThread",
+      );
+    } catch (e) {
+      console.error("postThread failed:", e);
+    }
   };
 
   const disableButtons = async (textMsg: string) => {
     if (!channelId || !messageTs) return;
     try {
-      await slackApi("chat.update", {
-        channel: channelId,
-        ts: messageTs,
-        text: textMsg,
-        blocks: [{ type: "section", text: { type: "mrkdwn", text: textMsg } }],
-      });
+      await withTimeout(
+        slackApi("chat.update", {
+          channel: channelId,
+          ts: messageTs,
+          text: textMsg,
+          blocks: [{ type: "section", text: { type: "mrkdwn", text: textMsg } }],
+        }),
+        SLACK_API_TIMEOUT_MS,
+        "disableButtons",
+      );
     } catch (e) {
       console.error("chat.update failed (non-fatal):", e);
     }
   };
+
+  // Handle "Ask a follow-up" button click - open modal
+  if (action.action_id === "ask_followup") {
+    const threadKeyValue = String(action.value || "").trim();
+    if (!threadKeyValue || !triggerId) {
+      await postThread("⚠️ Could not open follow-up dialog. Please try again.");
+      return json({ ok: true, error: "missing_thread_key_or_trigger" });
+    }
+
+    // Parse channelId:threadTs from value
+    const [modalChannelId, modalThreadTs] = threadKeyValue.split(":");
+    if (!modalChannelId || !modalThreadTs) {
+      await postThread("⚠️ Invalid thread context. Please start a new question.");
+      return json({ ok: true, error: "invalid_thread_key" });
+    }
+
+    try {
+      // Open the follow-up modal
+      await withTimeout(
+        slackApi("views.open", {
+          trigger_id: triggerId,
+          view: buildFollowupModal(modalChannelId, modalThreadTs),
+        }),
+        SLACK_API_TIMEOUT_MS,
+        "views.open",
+      );
+      return json({ ok: true, modal_opened: true });
+    } catch (e) {
+      console.error("Failed to open follow-up modal:", e);
+      await postThread("⚠️ Could not open follow-up dialog. Please try again.");
+      return json({ ok: true, error: String((e as any)?.message || e) });
+    }
+  }
 
   if (action.action_id === "dismiss") {
     await postThread(
@@ -1116,6 +1643,99 @@ async function handleSlackActions(
   }
 
   return json({ ok: true });
+}
+
+/**
+ * Handle modal submission for follow-up questions.
+ */
+async function handleModalSubmission(payload: any): Promise<Response> {
+  // Validate callback_id
+  if (payload.view?.callback_id !== "followup_modal_submit") {
+    return json({ ok: true });
+  }
+
+  // Extract private_metadata (channelId + threadTs)
+  let channelId: string;
+  let threadTs: string;
+  try {
+    const metadata = JSON.parse(payload.view?.private_metadata || "{}");
+    channelId = metadata.channelId;
+    threadTs = metadata.threadTs;
+  } catch {
+    console.error("Failed to parse modal private_metadata");
+    return json({
+      response_action: "errors",
+      errors: { followup_input_block: "Internal error. Please try again." },
+    });
+  }
+
+  if (!channelId || !threadTs) {
+    return json({
+      response_action: "errors",
+      errors: { followup_input_block: "Thread context missing. Please start a new question." },
+    });
+  }
+
+  // Extract follow-up text from input
+  const followupText = payload.view?.state?.values?.followup_input_block?.followup_text?.value || "";
+  if (!followupText.trim()) {
+    return json({
+      response_action: "errors",
+      errors: { followup_input_block: "Please enter a follow-up question." },
+    });
+  }
+
+  const user = payload.user?.username || payload.user?.id || "unknown";
+
+  // ACK the modal immediately (close it)
+  // Then process the follow-up asynchronously
+  (async () => {
+    try {
+      // Post a "thinking" message first
+      await slackApi("chat.postMessage", {
+        channel: channelId,
+        thread_ts: threadTs,
+        text: `_Processing follow-up: "${followupText.slice(0, 50)}${followupText.length > 50 ? "..." : ""}"_`,
+      });
+
+      // Handle the follow-up
+      const result = await handleFollowupInThread({
+        channelId,
+        threadTs,
+        user,
+        followupText: followupText.trim(),
+      });
+
+      if ("error" in result) {
+        await slackApi("chat.postMessage", {
+          channel: channelId,
+          thread_ts: threadTs,
+          text: `⚠️ ${result.error}`,
+        });
+        return;
+      }
+
+      // Post the follow-up response
+      await slackApi("chat.postMessage", {
+        channel: channelId,
+        thread_ts: threadTs,
+        text: "Follow-up response",
+        blocks: result.blocks,
+      });
+    } catch (e) {
+      console.error("Follow-up processing error:", e);
+      try {
+        await slackApi("chat.postMessage", {
+          channel: channelId,
+          thread_ts: threadTs,
+          text: `⚠️ Error processing follow-up: ${String((e as any)?.message || e)}`,
+        });
+      } catch {}
+    }
+  })();
+
+  // Return empty response to close the modal
+  return json({ response_action: "clear" });
 }
 
 // ============================================================================
@@ -1217,6 +1837,37 @@ const LLM_SEARCH_TIMEOUT_MS = 12000; // 12s timeout for LLM calls in /search
 
 async function handleSearch(url: URL): Promise<Response> {
   const q = url.searchParams.get("q") || "";
+
+  // Follow-up mode params (for debugging without Slack)
+  const threadChannel = url.searchParams.get("thread_channel");
+  const threadTsParam = url.searchParams.get("thread_ts");
+  const followupText = url.searchParams.get("followup");
+
+  // If follow-up params provided, simulate follow-up behavior
+  if (threadChannel && threadTsParam && followupText) {
+    const result = await handleFollowupInThread({
+      channelId: threadChannel,
+      threadTs: threadTsParam,
+      user: "search_debug",
+      followupText,
+    });
+
+    if ("error" in result) {
+      return json({
+        q,
+        followup: true,
+        error: result.error,
+      });
+    }
+
+    return json({
+      q,
+      followup: true,
+      llm: result.llm,
+      thread_channel: threadChannel,
+      thread_ts: threadTsParam,
+    });
+  }
 
   // STEP 1: Run director BEFORE any RAG/index work
   const routeDecision = await director(q);
@@ -1393,8 +2044,13 @@ async function handleSlackCommand(
       });
       const thread_ts = parent.ts;
 
+      // Pass thread context so follow-up button works
       const result = await handleQuestion(question, user_name, channel_name, {
         includeLinear: false,
+        threadContext: {
+          channelId: channel_id,
+          threadTs: thread_ts,
+        },
       });
 
       await slackApi("chat.postMessage", {
@@ -1462,9 +2118,14 @@ async function handleSlackEvents(
 
   // STEP 3: For answer routes, process with RAG
   try {
+    // Pass thread context so follow-up button works
     const result = await handleQuestion(question, user, channel, {
       includeLinear: true,
       linearTimeoutMs: 1200,
+      threadContext: {
+        channelId: channel,
+        threadTs: thread_ts,
+      },
     });
 
     await slackApi("chat.postMessage", {
@@ -1491,6 +2152,7 @@ async function handleBlobDebug(): Promise<Response> {
     const allKeys = await blob.list();
     const indexData = await blobGetIndex();
     const actionKeys = await actionBlob.list(ACTION_BLOB_PREFIX);
+    const threadKeys = await threadBlob.list(THREAD_STATE_BLOB_PREFIX);
 
     return json({
       ok: true,
@@ -1500,7 +2162,27 @@ async function handleBlobDebug(): Promise<Response> {
       indexChunks: indexData?.chunks?.length || 0,
       indexBuiltAt: indexData?.diag?.builtAt || null,
       actionBlobs: actionKeys.length,
+      threadStateBlobs: threadKeys.length,
       allBlobKeys: allKeys,
+    });
+  } catch (e) {
+    return json(
+      {
+        ok: false,
+        error: String((e as any)?.message || e),
+      },
+      500,
+    );
+  }
+}
+
+// Cleanup expired thread states (can be called manually or via cron)
+async function handleThreadCleanup(): Promise<Response> {
+  try {
+    const expiredCount = await expireThreadStates();
+    return json({
+      ok: true,
+      expired: expiredCount,
     });
   } catch (e) {
     return json(
@@ -1600,6 +2282,11 @@ export default async function handler(req: Request): Promise<Response> {
     // Debug endpoint
     if (req.method === "GET" && url.pathname === "/blob-debug") {
       return await handleBlobDebug();
+    }
+
+    // Thread cleanup endpoint (can be called manually or via cron)
+    if (req.method === "GET" && url.pathname === "/thread-cleanup") {
+      return await handleThreadCleanup();
     }
 
     return text("Not found", 404);

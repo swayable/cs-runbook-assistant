@@ -78,3 +78,29 @@ export type HeuristicSignals = {
     uiWorkflow: string[];
   };
 };
+
+// LLM summary result
+export type LlmSummary = {
+  summary: string;
+  recommendation: "file_ticket" | "try_steps";
+};
+
+// Follow-up entry in thread state
+export type FollowupEntry = {
+  user: string;
+  text: string;
+  ts: number;
+};
+
+// Thread state for follow-up conversations
+export type ThreadState = {
+  channelId: string;
+  threadTs: string;
+  createdAt: number;
+  rootQuestion: string;
+  rootUser: string;
+  followups: FollowupEntry[];
+  lastHits: Ranked[];
+  lastLlm: LlmSummary;
+  ticketDraft: string;
+};

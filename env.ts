@@ -44,6 +44,11 @@ export const BLOB_KEY = Deno.env.get("BLOB_KEY") || "cs_runbook_index_v1";
 export const ACTION_BLOB_PREFIX = "cs_action_v1:";
 export const ACTION_TTL_MS = 24 * 60 * 60 * 1000;
 
+// Thread state storage for follow-up conversations
+export const THREAD_STATE_BLOB_PREFIX = "cs_thread_v1:";
+export const THREAD_STATE_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
+export const MAX_FOLLOWUPS = 5; // Max follow-ups to store per thread
+
 export function mustEnv(): void {
   const missing = [
     ["SLACK_BOT_TOKEN", SLACK_BOT_TOKEN],
