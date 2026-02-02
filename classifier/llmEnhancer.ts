@@ -10,8 +10,8 @@
 import type { Chunk, ClassifierResult, EvidenceItem } from "../types/index.ts";
 
 const DEFAULT_MODEL = "claude-sonnet-4-20250514";
-const ENHANCE_TIMEOUT_MS = 10000; // 10 second timeout for LLM enhancement
-const ENHANCE_MAX_RETRIES = 2; // Max retries for enhancement
+const ENHANCE_TIMEOUT_MS = 15000; // 15 second timeout for LLM enhancement (Sonnet is slower)
+const ENHANCE_MAX_RETRIES = 3; // Max retries for enhancement
 const ENHANCE_RETRY_DELAY_MS = 500; // Base delay between retries
 
 // ============================================================================
