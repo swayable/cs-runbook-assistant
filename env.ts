@@ -41,8 +41,21 @@ export const CACHE_TTL_MS = MEM_CACHE_TTL_MS;
 export const LINEAR_TIMEOUT_MS = Number(Deno.env.get("LINEAR_TIMEOUT_MS") || 700);
 
 export const BLOB_KEY = Deno.env.get("BLOB_KEY") || "cs_runbook_index_v1";
+export const BLOB_KEY_V2 = Deno.env.get("BLOB_KEY_V2") || "cs_runbook_index_v2";
 export const ACTION_BLOB_PREFIX = "cs_action_v1:";
 export const ACTION_TTL_MS = 24 * 60 * 60 * 1000;
+
+// Embedding/Hybrid Search Configuration
+export const OPENAI_API_KEY = Deno.env.get("OPENAI_API_KEY") || "";
+export const HYBRID_SEARCH_ENABLED = Deno.env.get("HYBRID_SEARCH_ENABLED") !== "0";
+export const MAX_EMBED_CHUNKS = Number(Deno.env.get("MAX_EMBED_CHUNKS") || 1000);
+export const EMBEDDING_TIMEOUT_MS = Number(Deno.env.get("EMBEDDING_TIMEOUT_MS") || 5000);
+
+// LLM Director Configuration
+export const LLM_DIRECTOR_ENABLED = Deno.env.get("LLM_DIRECTOR_ENABLED") !== "0";
+export const LLM_DIRECTOR_TIMEOUT_MS = Number(Deno.env.get("LLM_DIRECTOR_TIMEOUT_MS") || 500);
+export const LLM_DIRECTOR_MODEL = Deno.env.get("LLM_DIRECTOR_MODEL") || "claude-3-5-haiku-20241022";
+export const LLM_DIRECTOR_MAX_TOKENS = Number(Deno.env.get("LLM_DIRECTOR_MAX_TOKENS") || 300);
 
 // Thread state storage for follow-up conversations
 export const THREAD_STATE_BLOB_PREFIX = "cs_thread_v1:";

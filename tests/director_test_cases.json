@@ -1,0 +1,127 @@
+{
+  "description": "Test cases for LLM Director intent classification and scope detection",
+  "how_to_test": "Run curl 'localhost:8000/search?q=<query>' and check the JSON response + logs",
+  "test_cases": [
+    {
+      "name": "Troubleshooting - pending state",
+      "query": "analysis is stuck in pending state",
+      "expected_intent": "troubleshooting",
+      "expected_in_scope": true,
+      "should_trigger_rag": true,
+      "notes": "Classic troubleshooting query, should match Pending runbooks"
+    },
+    {
+      "name": "Troubleshooting - error message",
+      "query": "ModelPrepSyncError after adding segment",
+      "expected_intent": "troubleshooting",
+      "expected_in_scope": true,
+      "should_trigger_rag": true,
+      "notes": "Specific error message should trigger troubleshooting"
+    },
+    {
+      "name": "Troubleshooting - vague issue",
+      "query": "tracker broken",
+      "expected_intent": "troubleshooting",
+      "expected_in_scope": true,
+      "should_trigger_rag": true,
+      "expected_expanded_query_contains": "tracker",
+      "notes": "Vague query should be expanded for better retrieval"
+    },
+    {
+      "name": "How-to - reanalyze",
+      "query": "how do I reanalyze a test?",
+      "expected_intent": "how_to",
+      "expected_in_scope": true,
+      "should_trigger_rag": true,
+      "notes": "Direct how-to question"
+    },
+    {
+      "name": "How-to - steps for export",
+      "query": "steps to export survey data as CSV",
+      "expected_intent": "how_to",
+      "expected_in_scope": true,
+      "should_trigger_rag": true,
+      "notes": "Process/steps request"
+    },
+    {
+      "name": "Info gathering - required info",
+      "query": "what info do I need for a stuck analysis?",
+      "expected_intent": "info_gathering",
+      "expected_in_scope": true,
+      "should_trigger_rag": true,
+      "notes": "Looking up information"
+    },
+    {
+      "name": "Info gathering - escalation",
+      "query": "what should I gather before escalating?",
+      "expected_intent": "info_gathering",
+      "expected_in_scope": true,
+      "should_trigger_rag": true,
+      "notes": "Pre-escalation information gathering"
+    },
+    {
+      "name": "Help query - capabilities",
+      "query": "what can you help me with?",
+      "expected_intent": "help",
+      "expected_in_scope": true,
+      "should_trigger_rag": false,
+      "notes": "Should trigger help response, skip RAG"
+    },
+    {
+      "name": "Help query - simple",
+      "query": "help",
+      "expected_intent": "help",
+      "expected_in_scope": true,
+      "should_trigger_rag": false,
+      "notes": "Direct help request"
+    },
+    {
+      "name": "Out of scope - coding question",
+      "query": "how do I write a React component?",
+      "expected_intent": "out_of_scope",
+      "expected_in_scope": false,
+      "should_trigger_rag": false,
+      "notes": "General coding question, not CS runbook content"
+    },
+    {
+      "name": "Out of scope - weather",
+      "query": "what's the weather like today?",
+      "expected_intent": "out_of_scope",
+      "expected_in_scope": false,
+      "should_trigger_rag": false,
+      "notes": "Completely unrelated query"
+    },
+    {
+      "name": "Out of scope - personal",
+      "query": "what's your favorite color?",
+      "expected_intent": "out_of_scope",
+      "expected_in_scope": false,
+      "should_trigger_rag": false,
+      "notes": "Personal/chat question"
+    },
+    {
+      "name": "Out of scope - internal tooling",
+      "query": "how do I deploy to kubernetes?",
+      "expected_intent": "out_of_scope",
+      "expected_in_scope": false,
+      "should_trigger_rag": false,
+      "notes": "Internal engineering question, not CS"
+    },
+    {
+      "name": "Edge case - ambiguous",
+      "query": "data not showing",
+      "expected_intent": "troubleshooting",
+      "expected_in_scope": true,
+      "should_trigger_rag": true,
+      "notes": "Ambiguous but likely customer issue, should proceed to RAG"
+    },
+    {
+      "name": "Edge case - survey issue",
+      "query": "survey won't complete",
+      "expected_intent": "troubleshooting",
+      "expected_in_scope": true,
+      "should_trigger_rag": true,
+      "notes": "Survey-related troubleshooting"
+    }
+  ]
+}

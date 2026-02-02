@@ -6,7 +6,8 @@
 //
 // CRON: /rebuild nightly (0 3 * * *), /warm every 15min (*/15 * * * *) for cache
 
-import { mustEnv, BLOB_KEY, LINEAR_API_KEY, LINEAR_TEAM_KEY, LINEAR_LABEL_NAME, LINEAR_TIMEOUT_MS, BLOB_MAX_AGE_MS, MAX_FOLLOWUPS } from "./env.ts";
+import { mustEnv, BLOB_KEY, BLOB_KEY_V2, LINEAR_API_KEY, LINEAR_TEAM_KEY, LINEAR_LABEL_NAME, LINEAR_TIMEOUT_MS, BLOB_MAX_AGE_MS, MAX_FOLLOWUPS, HYBRID_SEARCH_ENABLED, LLM_DIRECTOR_ENABLED } from "./env.ts";
+import { runLLMDirector, extractRunbookMetadata, type DirectorDecision, type RunbookMetadata } from "./director/index.ts";
 import { seenEvent, markEventSeen, seenSlashCommand, markSlashCommandSeen, logRetryHeaders } from "./storage/dedupeStore.ts";
 import { json, text } from "./util/response.ts";
 import {
@@ -27,10 +28,11 @@ import {
   blob as threadBlob,
   THREAD_STATE_BLOB_PREFIX,
 } from "./storage/threadStore.ts";
-import { rank } from "./retrieval/rank.ts";
+import { rank, rankHybrid } from "./retrieval/rank.ts";
 import { slackApi, verifySlackSignature } from "./slack/api.ts";
 import { classify, retrieveAndClassify, enhanceWithLLM } from "./classifier/index.ts";
-import type { ClassifierResult, ThreadState, LlmSummary as LlmSummaryType, FollowupEntry } from "./types/index.ts";
+import type { ClassifierResult, ThreadState, LlmSummary as LlmSummaryType, FollowupEntry, ChunkWithEmbedding } from "./types/index.ts";
+import { isV2Index } from "./types/index.ts";
 
 // ============================================================================
 // Types
@@ -62,8 +64,8 @@ type LinearIssue = {
 
 type RouteDecision =
   | { route: "help" }
-  | { route: "answer"; doRag: true }
-  | { route: "answer"; doRag: false; reason: string };
+  | { route: "answer"; doRag: true; directorHint?: DirectorDecision }
+  | { route: "answer"; doRag: false; reason: string; directorHint?: DirectorDecision };
 
 type LlmSummary = {
   summary: string;
@@ -115,6 +117,58 @@ function safeParseJson<T>(s: string): T | null {
   } catch {
     return null;
   }
+}
+
+/**
+ * Log structured search metrics for observability.
+ */
+function logDirectorMetrics(params: {
+  query: string;
+  decision: DirectorDecision | null;
+  latencyMs: number;
+  source: "web" | "slack_command" | "slack_followup";
+}): void {
+  const { query, decision, latencyMs, source } = params;
+  console.log(JSON.stringify({
+    event: "director",
+    query: query.slice(0, 100),
+    intent: decision?.intent || "fallback",
+    confidence: decision?.confidence || null,
+    in_scope: decision?.in_scope ?? null,
+    matched_topics: decision?.matched_topics?.slice(0, 5) || [],
+    has_expanded_query: !!decision?.expanded_query,
+    latencyMs,
+    source,
+    enabled: LLM_DIRECTOR_ENABLED,
+  }));
+}
+
+function logSearchMetrics(params: {
+  query: string;
+  hits: Ranked[];
+  ragUsed: boolean;
+  indexVersion: 1 | 2 | null;
+  embeddingUsed: boolean;
+  latencyMs: number;
+  source: "web" | "slack_command" | "slack_followup";
+  directorIntent?: string;
+  directorLatencyMs?: number;
+}): void {
+  const { query, hits, ragUsed, indexVersion, embeddingUsed, latencyMs, source, directorIntent, directorLatencyMs } = params;
+  console.log(JSON.stringify({
+    event: "search",
+    query: query.slice(0, 100),
+    topScore: hits[0]?.score || null,
+    topHitPage: hits[0]?.chunk?.pageTitle || null,
+    hitCount: hits.length,
+    ragUsed,
+    indexVersion,
+    embeddingUsed,
+    latencyMs,
+    directorIntent: directorIntent || null,
+    directorLatencyMs: directorLatencyMs || null,
+    source,
+  }));
 }
 
 async function withTimeout<T>(
@@ -196,15 +250,66 @@ function isHelpQuery(question: string): boolean {
  *
  * IMPORTANT: This function does NOT load the index. It only inspects the question.
  */
-async function director(question: string): Promise<RouteDecision> {
-  // Check for help queries FIRST - no RAG needed
-  if (isHelpQuery(question)) {
-    return { route: "help" };
+// Cache runbook metadata for director (avoid recomputing on every call)
+let RUNBOOK_METADATA_CACHE: { metadata: RunbookMetadata; ts: number } | null = null;
+const METADATA_CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes
+
+async function getRunbookMetadata(): Promise<RunbookMetadata | null> {
+  // Check cache
+  if (RUNBOOK_METADATA_CACHE && Date.now() - RUNBOOK_METADATA_CACHE.ts < METADATA_CACHE_TTL_MS) {
+    return RUNBOOK_METADATA_CACHE.metadata;
   }
 
-  // Default: proceed to answer flow with RAG
-  // The actual index availability is checked later in handleQuestion
-  return { route: "answer", doRag: true };
+  try {
+    const { chunks } = await buildIndex(false, { allowNotion: false });
+    if (chunks.length === 0) return null;
+    const metadata = extractRunbookMetadata(chunks);
+    RUNBOOK_METADATA_CACHE = { metadata, ts: Date.now() };
+    return metadata;
+  } catch {
+    return null;
+  }
+}
+
+async function director(question: string): Promise<{ route: RouteDecision; directorLatencyMs: number }> {
+  // STEP 1: Check for help queries FIRST (fast, deterministic)
+  if (isHelpQuery(question)) {
+    return { route: { route: "help" }, directorLatencyMs: 0 };
+  }
+
+  // STEP 2: Run LLM director if enabled (bounded by timeout)
+  const metadata = await getRunbookMetadata();
+  const { decision: llmDecision, latencyMs } = await runLLMDirector(question, metadata);
+
+  // STEP 3: Act on LLM decision if available
+  if (llmDecision) {
+    // Help intent detected by LLM
+    if (llmDecision.intent === "help") {
+      return { route: { route: "help" }, directorLatencyMs: latencyMs };
+    }
+
+    // Out of scope with high confidence - skip RAG
+    if (llmDecision.intent === "out_of_scope" && llmDecision.confidence === "high") {
+      return {
+        route: {
+          route: "answer",
+          doRag: false,
+          reason: llmDecision.out_of_scope_reason || "query not related to runbooks",
+          directorHint: llmDecision,
+        },
+        directorLatencyMs: latencyMs,
+      };
+    }
+
+    // In-scope: proceed to RAG with hints
+    return {
+      route: { route: "answer", doRag: true, directorHint: llmDecision },
+      directorLatencyMs: latencyMs,
+    };
+  }
+
+  // STEP 4: Fallback - proceed to RAG without hints
+  return { route: { route: "answer", doRag: true }, directorLatencyMs: latencyMs };
 }
 
 // ============================================================================
@@ -937,8 +1042,33 @@ function buildNoRelevantBlocks(args: {
   llmSummary?: string;
   actionId?: string;
   threadKey?: string; // channelId:threadTs for follow-up button
+  directorHint?: DirectorDecision;
 }): any[] {
   const reqInfoText = args.requiredInfo.slice(0, 6).map((x) => `• ${x}`).join("\n");
+  const { directorHint } = args;
+
+  // Customize header and suggestion based on director insight
+  let headerText: string;
+  let suggestionText: string;
+
+  if (directorHint?.intent === "out_of_scope") {
+    headerText = "*This doesn't seem to be covered by our runbooks*";
+    suggestionText = directorHint.out_of_scope_reason
+      ? `${directorHint.out_of_scope_reason}\n\nIf this is a customer issue, try rephrasing with specific error messages or symptoms.`
+      : "This query appears to be outside the scope of CS runbooks. If it's a customer issue, try adding more context.";
+  } else if (directorHint?.matched_topics?.length) {
+    headerText = "*No exact match found*";
+    const topics = directorHint.matched_topics.slice(0, 4).join(", ");
+    suggestionText = `I searched runbooks related to: ${topics}\n\nTry being more specific about the error or symptom.`;
+  } else {
+    headerText = "*No strong runbook match found*";
+    suggestionText = "I couldn't find a relevant runbook page for your question. This might be a new issue type or require more specific details.";
+  }
+
+  // Add expanded query hint if available
+  if (directorHint?.expanded_query && directorHint.expanded_query.toLowerCase() !== args.question.toLowerCase()) {
+    suggestionText += `\n\n_Try searching:_ "${directorHint.expanded_query}"`;
+  }
 
   const summaryText = args.llmSummary
     ? `*Summary*\n${args.llmSummary}\n\n`
@@ -949,7 +1079,7 @@ function buildNoRelevantBlocks(args: {
       type: "section",
       text: {
         type: "mrkdwn",
-        text: `*No strong runbook match found*\n\n${summaryText}I couldn't find a relevant runbook page for your question. This might be a new issue type or require more specific details.`,
+        text: `${headerText}\n\n${summaryText}${suggestionText}`,
       },
     },
     {
@@ -1284,7 +1414,7 @@ async function handleQuestion(
     : undefined;
 
   // STEP 1: Run director BEFORE any RAG/index work
-  const routeDecision = await director(question);
+  const { route: routeDecision, directorLatencyMs } = await director(question);
 
   // STEP 2: If help route, return help immediately (NO RAG, NO index loading)
   if (routeDecision.route === "help") {
@@ -1296,16 +1426,22 @@ async function handleQuestion(
     };
   }
 
+  // Extract director hint for later use
+  const directorHint = "directorHint" in routeDecision ? routeDecision.directorHint : undefined;
+
   // STEP 3: Try to load index for RAG
+  const searchStartTime = Date.now();
   let chunks: Chunk[] = [];
   let indexAvailable = false;
   let noContextReason: string | undefined;
+  let indexVersion: 1 | 2 | null = null;
 
   try {
     // IMPORTANT: never crawl Notion here. If index isn't ready, degrade gracefully.
     const result = await buildIndex(false, { allowNotion: false });
     chunks = result.chunks;
     indexAvailable = chunks.length > 0;
+    indexVersion = result.indexVersion;
   } catch (e) {
     // Index not available - degrade gracefully
     noContextReason = "runbook index not available";
@@ -1318,9 +1454,24 @@ async function handleQuestion(
     finalRoute = { route: "answer", doRag: false, reason: noContextReason || "index empty" };
   }
 
-  // STEP 5: Rank runbook hits (if index available)
-  const hits = indexAvailable ? rank(question, chunks, 5) : [];
+  // STEP 5: Rank runbook hits (if index available) - use hybrid when embeddings available
+  const { results: hits, embeddingUsed } = indexAvailable
+    ? await rankHybrid(question, chunks as ChunkWithEmbedding[], 5)
+    : { results: [], embeddingUsed: false };
   const ragUsed = hits.length > 0 && hits[0].score >= RELEVANCE_SCORE_THRESHOLD;
+
+  // Log search metrics for observability
+  logSearchMetrics({
+    query: question,
+    hits,
+    ragUsed,
+    indexVersion,
+    embeddingUsed,
+    latencyMs: Date.now() - searchStartTime,
+    source: "slack_command",
+    directorIntent: directorHint?.intent,
+    directorLatencyMs,
+  });
 
   // Update route if no relevant hits
   if (indexAvailable && !ragUsed) {
@@ -1376,6 +1527,7 @@ async function handleQuestion(
         llmSummary: llmResult.summary,
         actionId,
         threadKey: threadKeyStr,
+        directorHint,
       }),
       route: finalRoute,
       llm: llmResult,
@@ -1528,17 +1680,33 @@ async function handleFollowupInThread(params: {
   }
 
   // Try to load index for RAG
+  const searchStartTime = Date.now();
   let chunks: Chunk[] = [];
+  let indexVersion: 1 | 2 | null = null;
   try {
     const result = await buildIndex(false, { allowNotion: false });
     chunks = result.chunks;
+    indexVersion = result.indexVersion;
   } catch (e) {
     console.warn("Index not available for follow-up:", String((e as any)?.message || e));
   }
 
-  // Combine root question + follow-up for ranking
+  // Combine root question + follow-up for ranking - use hybrid when available
   const combinedQuery = `${state.rootQuestion} ${followupText}`;
-  const hits = chunks.length > 0 ? rank(combinedQuery, chunks, 5) : state.lastHits;
+  const { results: hits, embeddingUsed } = chunks.length > 0
+    ? await rankHybrid(combinedQuery, chunks as ChunkWithEmbedding[], 5)
+    : { results: state.lastHits, embeddingUsed: false };
+
+  // Log search metrics for observability
+  logSearchMetrics({
+    query: combinedQuery,
+    hits,
+    ragUsed: hits.length > 0,
+    indexVersion,
+    embeddingUsed,
+    latencyMs: Date.now() - searchStartTime,
+    source: "slack_followup",
+  });
 
   // Get LLM summary for follow-up
   let llmResult: LlmSummary;
@@ -1853,23 +2021,42 @@ async function handleHealth(): Promise<Response> {
   let blobStale = false;
   let blobBuiltAt: string | null = null;
   let chunkCount = 0;
+  let indexVersion: 1 | 2 | null = null;
+  let embeddingModel: string | null = null;
+  let chunksWithEmbeddings = 0;
 
   try {
-    const indexData = await blobGetIndex();
-    if (indexData) {
+    const indexResult = await blobGetIndex();
+    if (indexResult) {
+      const { payload, version } = indexResult;
       blobPresent = true;
-      const blobAgeMs = Date.now() - indexData.builtAtMs;
+      indexVersion = version;
+      const blobAgeMs = Date.now() - payload.builtAtMs;
       blobAgeSec = Math.floor(blobAgeMs / 1000);
       blobStale = blobAgeMs > BLOB_MAX_AGE_MS;
-      blobBuiltAt = indexData.diag?.builtAt || null;
-      chunkCount = indexData.chunks?.length || 0;
+      blobBuiltAt = payload.diag?.builtAt || null;
+      chunkCount = payload.chunks?.length || 0;
+
+      // Extract embedding info from v2 index
+      if (isV2Index(payload)) {
+        embeddingModel = payload.diag?.embeddingModel || null;
+        chunksWithEmbeddings = payload.diag?.chunksEmbedded || 0;
+      }
     }
   } catch {}
+
+  // Use cache version if available
+  if (cache?.version) {
+    indexVersion = cache.version;
+  }
 
   // Use cache chunk count if available, otherwise use blob chunk count
   if (cache?.chunks?.length) {
     chunkCount = cache.chunks.length;
   }
+
+  // Determine if embedding is actually enabled and working
+  const embeddingEnabled = HYBRID_SEARCH_ENABLED && indexVersion === 2;
 
   return json({
     ok: true,
@@ -1881,6 +2068,11 @@ async function handleHealth(): Promise<Response> {
     builtAt: blobBuiltAt || cache?.diag?.builtAt || null,
     stale: blobStale,
     blobKey: BLOB_KEY,
+    // Embedding status
+    embedding_enabled: embeddingEnabled,
+    index_version: indexVersion,
+    embedding_model: embeddingModel,
+    chunks_with_embeddings: chunksWithEmbeddings,
   });
 }
 
@@ -1971,7 +2163,7 @@ async function handleSearch(url: URL): Promise<Response> {
   }
 
   // STEP 1: Run director BEFORE any RAG/index work
-  const routeDecision = await director(q);
+  const { route: routeDecision, directorLatencyMs } = await director(q);
 
   // STEP 2: If help route, return help immediately (NO RAG, NO index loading)
   if (routeDecision.route === "help") {
@@ -1989,25 +2181,46 @@ async function handleSearch(url: URL): Promise<Response> {
     });
   }
 
+  // Extract director hint for later use
+  const directorHint = "directorHint" in routeDecision ? routeDecision.directorHint : undefined;
+
   // STEP 3: Try to get chunks (don't throw if unavailable)
+  const searchStartTime = Date.now();
   let chunks: Chunk[] = [];
   let stale: boolean | undefined;
   let blobAgeMs: number | undefined;
   let noContextReason: string | undefined;
+  let indexVersion: 1 | 2 | null = null;
 
   try {
     const result = await buildIndex(false, { allowNotion: false });
     chunks = result.chunks;
     stale = result.stale;
     blobAgeMs = result.blobAgeMs;
+    indexVersion = result.indexVersion;
   } catch (e) {
     noContextReason = "runbook index not available";
     console.warn("Index not available for /search:", String((e as any)?.message || e));
   }
 
-  // STEP 4: Rank hits (if index available)
-  const hits = chunks.length > 0 ? rank(q, chunks, 5) : [];
+  // STEP 4: Rank hits (if index available) - use hybrid when embeddings available
+  const { results: hits, embeddingUsed } = chunks.length > 0
+    ? await rankHybrid(q, chunks as ChunkWithEmbedding[], 5)
+    : { results: [], embeddingUsed: false };
   const ragUsed = hits.length > 0 && hits[0].score >= RELEVANCE_SCORE_THRESHOLD;
+
+  // Log search metrics for observability
+  logSearchMetrics({
+    query: q,
+    hits,
+    ragUsed,
+    indexVersion,
+    embeddingUsed,
+    latencyMs: Date.now() - searchStartTime,
+    source: "web",
+    directorIntent: directorHint?.intent,
+    directorLatencyMs,
+  });
 
   // Determine actual no-context reason
   if (!noContextReason && !ragUsed) {
@@ -2084,7 +2297,8 @@ async function handleClassify(url: URL): Promise<Response> {
   // Optionally enhance with LLM
   let finalResult: ClassifierResult = result;
   if (useLLM) {
-    const relevantChunks = rank(q, chunks, 5).map((r) => r.chunk);
+    const { results: rankedHits } = await rankHybrid(q, chunks as ChunkWithEmbedding[], 5);
+    const relevantChunks = rankedHits.map((r) => r.chunk);
     finalResult = await enhanceWithLLM(q, relevantChunks, result);
   }
 
@@ -2111,7 +2325,7 @@ async function handleSlackCommand(
   console.log(`[slack/command] trigger_id=${trigger_id}, channel=${channel_id}, question="${question.slice(0, 50)}..."`);
 
   // STEP 1: Run director BEFORE any RAG/index work
-  const routeDecision = await director(question);
+  const { route: routeDecision } = await director(question);
 
   // STEP 2: If help route, respond ephemeral only (no parent post, no RAG)
   if (routeDecision.route === "help") {
@@ -2271,7 +2485,7 @@ async function handleSlackEvents(
       }
 
       // STEP 1: Run director BEFORE any RAG/index work
-      const routeDecision = await director(question);
+      const { route: routeDecision } = await director(question);
 
       // STEP 2: If help route, reply with help blocks only (no RAG)
       if (routeDecision.route === "help") {
@@ -2351,7 +2565,7 @@ async function handleSlackEvents(
 async function handleBlobDebug(): Promise<Response> {
   try {
     const allKeys = await blob.list();
-    const indexData = await blobGetIndex();
+    const indexResult = await blobGetIndex();
     const actionKeys = await actionBlob.list(ACTION_BLOB_PREFIX);
     const threadKeys = await threadBlob.list(THREAD_STATE_BLOB_PREFIX);
 
@@ -2359,9 +2573,10 @@ async function handleBlobDebug(): Promise<Response> {
       ok: true,
       totalBlobs: allKeys.length,
       indexKey: INDEX_BLOB_KEY,
-      indexExists: indexData !== null,
-      indexChunks: indexData?.chunks?.length || 0,
-      indexBuiltAt: indexData?.diag?.builtAt || null,
+      indexExists: indexResult !== null,
+      indexChunks: indexResult?.payload?.chunks?.length || 0,
+      indexBuiltAt: indexResult?.payload?.diag?.builtAt || null,
+      indexVersion: indexResult?.version || null,
       actionBlobs: actionKeys.length,
       threadStateBlobs: threadKeys.length,
       allBlobKeys: allKeys,
