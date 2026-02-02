@@ -11,20 +11,21 @@ import type { Chunk, ClassifierResult, EvidenceItem } from "../types/index.ts";
 
 const DEFAULT_MODEL = "claude-sonnet-4-20250514";
 const ENHANCE_TIMEOUT_MS = 10000; // 10 second timeout for LLM enhancement
+const ENHANCE_MAX_RETRIES = 2; // Max retries for enhancement
+const ENHANCE_RETRY_DELAY_MS = 500; // Base delay between retries
 
 // ============================================================================
-// Anthropic API caller
+// Anthropic API caller with retry
 // ============================================================================
 
-async function callAnthropic(
+async function callAnthropicOnce(
   systemPrompt: string,
   userMessage: string,
-  maxTokens = 800
+  maxTokens: number,
+  model: string
 ): Promise<string | null> {
   const apiKey = Deno.env.get("ANTHROPIC_API_KEY");
   if (!apiKey) return null;
-
-  const model = Deno.env.get("ANTHROPIC_MODEL") || DEFAULT_MODEL;
 
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), ENHANCE_TIMEOUT_MS);
@@ -49,8 +50,9 @@ async function callAnthropic(
     clearTimeout(timeoutId);
 
     if (!res.ok) {
-      console.error("Anthropic API error:", res.status, await res.text());
-      return null;
+      const errText = await res.text();
+      console.error("Anthropic API error:", res.status, errText);
+      throw new Error(`API error ${res.status}: ${errText.slice(0, 100)}`);
     }
 
     const data = await res.json();
@@ -58,12 +60,37 @@ async function callAnthropic(
   } catch (e) {
     clearTimeout(timeoutId);
     if ((e as Error).name === "AbortError") {
-      console.warn("LLM enhancement timed out after", ENHANCE_TIMEOUT_MS, "ms");
-    } else {
-      console.error("Anthropic call failed:", e);
+      throw new Error(`Timeout after ${ENHANCE_TIMEOUT_MS}ms`);
     }
-    return null;
+    throw e;
   }
+}
+
+async function callAnthropic(
+  systemPrompt: string,
+  userMessage: string,
+  maxTokens = 800
+): Promise<string | null> {
+  const apiKey = Deno.env.get("ANTHROPIC_API_KEY");
+  if (!apiKey) return null;
+
+  const model = Deno.env.get("ANTHROPIC_MODEL") || DEFAULT_MODEL;
+
+  for (let attempt = 0; attempt < ENHANCE_MAX_RETRIES; attempt++) {
+    try {
+      return await callAnthropicOnce(systemPrompt, userMessage, maxTokens, model);
+    } catch (e) {
+      const isLastAttempt = attempt === ENHANCE_MAX_RETRIES - 1;
+      if (isLastAttempt) {
+        console.warn(`LLM enhancement failed after ${ENHANCE_MAX_RETRIES} attempts:`, (e as Error).message);
+        return null;
+      }
+      const delay = ENHANCE_RETRY_DELAY_MS * Math.pow(2, attempt);
+      console.warn(`LLM enhancement attempt ${attempt + 1} failed, retrying in ${delay}ms...`);
+      await new Promise((r) => setTimeout(r, delay));
+    }
+  }
+  return null;
 }
 
 function safeParseJson<T>(s: string): T | null {

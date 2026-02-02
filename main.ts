@@ -2084,6 +2084,15 @@ async function handleSlackEvents(
 
       // STEP 4: For new questions (or follow-ups without state), process with RAG
       console.log(`[slack/events] Starting handleQuestion...`);
+
+      // Post a "thinking" message first so user knows we're working
+      const thinkingMsg = await slackApi("chat.postMessage", {
+        channel,
+        thread_ts: replyThreadTs,
+        text: "🔍 Searching runbooks and analyzing...",
+      });
+      const thinkingTs = thinkingMsg?.ts;
+
       const result = await handleQuestion(question, user, channel, {
         includeLinear: true,
         linearTimeoutMs: 1200,
@@ -2094,12 +2103,23 @@ async function handleSlackEvents(
       });
       console.log(`[slack/events] handleQuestion complete, posting response...`);
 
-      await slackApi("chat.postMessage", {
-        channel,
-        thread_ts: replyThreadTs,
-        text: "CS helper response",
-        blocks: result.blocks,
-      });
+      // Update the thinking message with the actual response
+      if (thinkingTs) {
+        await slackApi("chat.update", {
+          channel,
+          ts: thinkingTs,
+          text: "CS helper response",
+          blocks: result.blocks,
+        });
+      } else {
+        // Fallback: post new message if update fails
+        await slackApi("chat.postMessage", {
+          channel,
+          thread_ts: replyThreadTs,
+          text: "CS helper response",
+          blocks: result.blocks,
+        });
+      }
       console.log(`[slack/events] Response posted successfully`);
     } catch (e) {
       console.error("[slack/events] Background processing error:", e);
