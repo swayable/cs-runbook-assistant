@@ -387,13 +387,43 @@ function logFallback(cause: FallbackCause, durationMs: number, message: string):
 }
 
 function safeParseJsonTickets(s: string): { selected: Array<{ idx: number; reason: string }> } | null {
-  try {
-    const jsonMatch = s.match(/```(?:json)?\s*([\s\S]*?)```/);
-    const toParse = jsonMatch ? jsonMatch[1].trim() : s.trim();
-    return JSON.parse(toParse);
-  } catch {
-    return null;
+  // Try multiple extraction strategies
+  const strategies = [
+    // Strategy 1: Extract from markdown code block
+    () => {
+      const match = s.match(/```(?:json)?\s*([\s\S]*?)```/);
+      return match ? match[1].trim() : null;
+    },
+    // Strategy 2: Find JSON object starting with {"selected"
+    () => {
+      const match = s.match(/\{\s*"selected"\s*:\s*\[[\s\S]*?\]\s*\}/);
+      return match ? match[0] : null;
+    },
+    // Strategy 3: Find any JSON object with square brackets
+    () => {
+      const match = s.match(/\{[\s\S]*\[[\s\S]*\][\s\S]*\}/);
+      return match ? match[0] : null;
+    },
+    // Strategy 4: Raw string is JSON
+    () => s.trim(),
+  ];
+
+  for (const strategy of strategies) {
+    try {
+      const candidate = strategy();
+      if (!candidate) continue;
+      const parsed = JSON.parse(candidate);
+      if (parsed && Array.isArray(parsed.selected)) {
+        return parsed;
+      }
+    } catch {
+      // Try next strategy
+    }
   }
+
+  // Log first 500 chars to help debug
+  console.warn(`[safeParseJsonTickets] Failed to parse LLM response. First 500 chars: ${s.slice(0, 500)}`);
+  return null;
 }
 
 /**
