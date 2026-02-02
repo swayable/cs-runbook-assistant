@@ -74,7 +74,8 @@ async function callAnthropic(
   const apiKey = Deno.env.get("ANTHROPIC_API_KEY");
   if (!apiKey) return null;
 
-  const model = Deno.env.get("ANTHROPIC_MODEL") || DEFAULT_MODEL;
+  // Use dedicated env var, don't let ANTHROPIC_MODEL override (that's for summarizer)
+  const model = Deno.env.get("LLM_ENHANCER_MODEL") || DEFAULT_MODEL;
 
   for (let attempt = 0; attempt < ENHANCE_MAX_RETRIES; attempt++) {
     try {
