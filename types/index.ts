@@ -43,3 +43,38 @@ export type ActionPayload = {
   createdAt: number;
   consumedAt?: number;
 };
+
+// Classifier output types
+export type Confidence = "high" | "medium" | "low";
+
+export type EvidenceItem = {
+  pageTitle: string;
+  sectionTitle: string;
+  url: string;
+  excerpt: string;
+};
+
+export type ClassifierResult = {
+  can_cs_handle: boolean;
+  confidence: Confidence;
+  reasons: string[];
+  cs_safe_steps: string[];
+  escalation_info_needed: string[];
+  evidence: EvidenceItem[];
+};
+
+// Heuristic detection results
+export type HeuristicSignals = {
+  engineerRequired: boolean;
+  csHandlable: boolean;
+  engineerReasons: string[];
+  csReasons: string[];
+  detectedPatterns: {
+    cli: string[];
+    scripts: string[];
+    database: string[];
+    infra: string[];
+    dangerous: string[];
+    uiWorkflow: string[];
+  };
+};

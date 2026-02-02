@@ -15,6 +15,8 @@ import {
 import { blob as actionBlob, ACTION_BLOB_PREFIX, putAction, consumeAction } from "./storage/actionStore.ts";
 import { rank, isEngineeringOnly } from "./retrieval/rank.ts";
 import { slackApi, verifySlackSignature } from "./slack/api.ts";
+import { retrieveAndClassify, enhanceWithLLM } from "./classifier/index.ts";
+import type { ClassifierResult } from "./types/index.ts";
 
 // ============================================================================
 // Types
@@ -999,6 +1001,34 @@ async function handleSearch(url: URL): Promise<Response> {
   return json(response);
 }
 
+async function handleClassify(url: URL): Promise<Response> {
+  const q = url.searchParams.get("q") || "";
+  const useLLM = url.searchParams.get("llm") === "1";
+
+  if (!q.trim()) {
+    return json({
+      error: "Missing query parameter 'q'",
+      usage: "/classify?q=your+question+here&llm=1",
+    }, 400);
+  }
+
+  // Get chunks without crawling Notion
+  const { chunks } = await buildIndex(false, { allowNotion: false });
+
+  // Run deterministic classification
+  const result = retrieveAndClassify(q, chunks, 5);
+
+  // Optionally enhance with LLM
+  let finalResult: ClassifierResult = result;
+  if (useLLM) {
+    const relevantChunks = rank(q, chunks, 5).map((r) => r.chunk);
+    finalResult = await enhanceWithLLM(q, relevantChunks, result);
+  }
+
+  // Return strict JSON format as specified
+  return json(finalResult);
+}
+
 // Slack handlers
 
 async function handleSlackCommand(
@@ -1152,7 +1182,7 @@ export default async function handler(req: Request): Promise<Response> {
         const cache = getCache();
         const age = cache ? Math.floor((Date.now() - cache.builtAtMs) / 1000) : "n/a";
         return text(
-          `OK\nchunks=${chunks.length}\ncache_age_sec=${age}\nsource=${source}\nblobKey=${BLOB_KEY}\n\nTry: /search?q=finalize pending\nTry: /debug\nTry: /rebuild\n`,
+          `OK\nchunks=${chunks.length}\ncache_age_sec=${age}\nsource=${source}\nblobKey=${BLOB_KEY}\n\nTry: /search?q=finalize pending\nTry: /classify?q=finalize pending&llm=1\nTry: /debug\nTry: /rebuild\n`,
         );
       } catch {
         return text(`Index not ready.\nRun: /rebuild\n`, 200);
@@ -1171,6 +1201,9 @@ export default async function handler(req: Request): Promise<Response> {
     }
     if (req.method === "GET" && url.pathname === "/search") {
       return await handleSearch(url);
+    }
+    if (req.method === "GET" && url.pathname === "/classify") {
+      return await handleClassify(url);
     }
 
     // Slack endpoints (verify signature)

@@ -1,6 +1,10 @@
 {
   "$schema": "https://raw.githubusercontent.com/denoland/deno/98f62cee78e85bfc47c62ed703777c6bc8794f1c/cli/schemas/config-file.v1.json",
   "lock": false,
+  "tasks": {
+    "dev": "deno run --allow-net --allow-env --allow-read --allow-import dev.ts",
+    "check": "deno check main.ts"
+  },
   "compilerOptions": {
     "noImplicitAny": false,
     "strict": true,
