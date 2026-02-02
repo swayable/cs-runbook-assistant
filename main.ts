@@ -1091,7 +1091,9 @@ async function handleQuestion(
   const enhancedClassifier = await enhanceWithLLM(question, hitChunks, classifierResult);
 
   // Get LLM summary for the response
+  console.log(`[handleQuestion] Starting llmSummarize...`);
   const llmResult = await llmSummarize(question, hits);
+  console.log(`[handleQuestion] llmSummarize complete: ${llmResult.summary.slice(0, 50)}...`);
 
   // Linear duplicates (optional + time-bounded)
   const includeLinear = opts.includeLinear === true;
@@ -2076,6 +2078,7 @@ async function handleSlackEvents(
       }
 
       // STEP 4: For new questions (or follow-ups without state), process with RAG
+      console.log(`[slack/events] Starting handleQuestion...`);
       const result = await handleQuestion(question, user, channel, {
         includeLinear: true,
         linearTimeoutMs: 1200,
@@ -2084,6 +2087,7 @@ async function handleSlackEvents(
           threadTs: replyThreadTs,
         },
       });
+      console.log(`[slack/events] handleQuestion complete, posting response...`);
 
       await slackApi("chat.postMessage", {
         channel,
@@ -2091,6 +2095,7 @@ async function handleSlackEvents(
         text: "CS helper response",
         blocks: result.blocks,
       });
+      console.log(`[slack/events] Response posted successfully`);
     } catch (e) {
       console.error("[slack/events] Background processing error:", e);
       try {
