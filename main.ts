@@ -71,12 +71,14 @@ type LinearIssue = {
   state?: { name: string; type: string } | null;
 };
 
-type DirectorDecision = {
-  kind: "capabilities" | "runbook" | "no_relevant";
-  reason: string;
-  query: string;
-  hits: Ranked[];
-};
+// ============================================================================
+// Director Types (runs BEFORE any RAG/index work)
+// ============================================================================
+
+type RouteDecision =
+  | { route: "help" }
+  | { route: "answer"; doRag: true }
+  | { route: "answer"; doRag: false; reason: string };
 
 type LlmSummary = {
   summary: string;
@@ -86,6 +88,14 @@ type LlmSummary = {
 type AnswerOpts = {
   includeLinear?: boolean;
   linearTimeoutMs?: number;
+};
+
+type AnswerResult = {
+  blocks: any[];
+  route: RouteDecision;
+  llm?: LlmSummary;
+  hits: Ranked[];
+  ragUsed: boolean;
 };
 
 // ============================================================================
@@ -138,74 +148,164 @@ async function withTimeout<T>(
 }
 
 // ============================================================================
-// Director: Determines response type
+// Director: Routes question BEFORE any RAG/index work
 // ============================================================================
 
-const CAPABILITIES_PATTERNS = [
-  "help",
-  "what can you do",
-  "what do you do",
-  "capabilities",
-  "examples",
-  "how do i use",
-  "how to use",
-  "usage",
-  "commands",
-  "what should i ask",
-  "what kinds of things",
-  "/help",
+const HELP_PATTERNS = [
+  // Direct help requests
+  /^help$/i,
+  /^\/help$/i,
+  /^\?$/,
+  // Capability questions
+  /what\s+can\s+you\s+do/i,
+  /what\s+kind\s+of\s+stuff\s+can\s+you\s+do/i,
+  /what\s+do\s+you\s+do/i,
+  /what\s+are\s+you/i,
+  /who\s+are\s+you/i,
+  /what\s+is\s+this/i,
+  // Usage questions
+  /how\s+do\s+i\s+use/i,
+  /how\s+to\s+use/i,
+  /how\s+does\s+this\s+work/i,
+  // Feature/capability queries
+  /\bcapabilities\b/i,
+  /\bcommands\b/i,
+  /\bfeatures\b/i,
+  /\bexamples?\b/i,
+  /\busage\b/i,
+  // Intent questions
+  /what\s+should\s+i\s+ask/i,
+  /what\s+can\s+i\s+ask/i,
+  /what\s+kinds?\s+of\s+things/i,
+  /what\s+questions/i,
+  /show\s+me\s+examples/i,
+  // Greeting-only (no actual question)
+  /^(hi|hello|hey|yo|sup)[\s!?.]*$/i,
 ];
 
-function isCapabilitiesQuery(q: string): boolean {
-  const norm = normalize(q);
-  if (!norm) return true; // empty query -> show capabilities
-  return CAPABILITIES_PATTERNS.some((p) => norm.includes(p));
+/**
+ * Detects help/capabilities queries that should NOT trigger RAG.
+ * Returns true for questions like "what can you do", "help", "capabilities", etc.
+ */
+function isHelpQuery(question: string): boolean {
+  const q = normalize(question);
+
+  // Empty or whitespace-only -> show help
+  if (!q || q.length === 0) return true;
+
+  // Check against all help patterns
+  for (const pattern of HELP_PATTERNS) {
+    if (pattern.test(q)) return true;
+  }
+
+  return false;
 }
 
-const RELEVANCE_SCORE_THRESHOLD = 2;
-
-async function director(question: string, chunks: Chunk[]): Promise<DirectorDecision> {
-  const query = normalize(question);
-
-  // Check for capabilities/help queries first
-  if (isCapabilitiesQuery(question)) {
-    return {
-      kind: "capabilities",
-      reason: "help or capabilities request",
-      query,
-      hits: [],
-    };
+/**
+ * Director function: runs BEFORE any RAG/index work.
+ * Determines whether to show help or proceed with answer flow.
+ *
+ * IMPORTANT: This function does NOT load the index. It only inspects the question.
+ */
+async function director(question: string): Promise<RouteDecision> {
+  // Check for help queries FIRST - no RAG needed
+  if (isHelpQuery(question)) {
+    return { route: "help" };
   }
 
-  // Rank runbook hits
-  const hits = rank(question, chunks, 5);
+  // Default: proceed to answer flow with RAG
+  // The actual index availability is checked later in handleQuestion
+  return { route: "answer", doRag: true };
+}
 
-  // Check if we have any relevant content
-  if (hits.length === 0) {
-    return {
-      kind: "no_relevant",
-      reason: "no runbook hits",
-      query,
-      hits: [],
-    };
-  }
+// ============================================================================
+// Help Content Builders (CEO-friendly)
+// ============================================================================
 
-  // Check if top score is below threshold
-  if (hits[0].score < RELEVANCE_SCORE_THRESHOLD) {
-    return {
-      kind: "no_relevant",
-      reason: `top score ${hits[0].score} below threshold ${RELEVANCE_SCORE_THRESHOLD}`,
-      query,
-      hits,
-    };
-  }
+/**
+ * Build plain text help content for web endpoints.
+ */
+function buildHelpText(): string {
+  return `CS Helper — Your Customer Support Assistant
 
-  return {
-    kind: "runbook",
-    reason: "found relevant runbook content",
-    query,
-    hits,
-  };
+I help CS teams quickly find the right runbook steps and triage customer issues.
+
+📋 TRIAGING DELIVERY ISSUES
+• "Analysis is stuck in pending state"
+• "Finalize not showing up for test"
+• "ModelPrepSyncError after adding segment"
+• "Survey responses not appearing in tracker"
+
+🔍 FINDING RUNBOOK STEPS
+• "How do I reanalyze a test?"
+• "Steps to reset participant data"
+• "What to check when export fails"
+
+📝 COLLECTING REQUIRED INFO
+• "What info do I need for a stuck analysis?"
+• "What should I gather before escalating a tracker issue?"
+
+🎫 WHEN TO FILE A TICKET
+• Describe the issue and I'll suggest whether to escalate
+• I'll help you identify possible duplicate tickets
+• I'll pre-fill the ticket with relevant context
+
+💡 Tips:
+• Include specific error messages for better matches
+• Mention the feature area (tracker, analysis, export, etc.)
+• Describe what the customer is trying to do`;
+}
+
+/**
+ * Build Slack blocks for help response.
+ */
+function buildHelpBlocks(): any[] {
+  return [
+    {
+      type: "section",
+      text: {
+        type: "mrkdwn",
+        text: "*CS Helper — Your Customer Support Assistant*\n\nI help CS teams quickly find the right runbook steps and triage customer issues.",
+      },
+    },
+    {
+      type: "section",
+      text: {
+        type: "mrkdwn",
+        text: "*📋 Triaging Delivery Issues*\n• `analysis is stuck in pending state`\n• `finalize not showing up for test`\n• `ModelPrepSyncError after adding segment`\n• `survey responses not appearing in tracker`",
+      },
+    },
+    {
+      type: "section",
+      text: {
+        type: "mrkdwn",
+        text: "*🔍 Finding Runbook Steps*\n• `how do I reanalyze a test?`\n• `steps to reset participant data`\n• `what to check when export fails`",
+      },
+    },
+    {
+      type: "section",
+      text: {
+        type: "mrkdwn",
+        text: "*📝 Collecting Required Info*\n• `what info do I need for a stuck analysis?`\n• `what should I gather before escalating?`",
+      },
+    },
+    {
+      type: "section",
+      text: {
+        type: "mrkdwn",
+        text: "*🎫 When to File a Ticket*\n• Describe the issue and I'll suggest whether to escalate\n• I'll help identify possible duplicate tickets\n• I'll pre-fill the ticket with relevant context",
+      },
+    },
+    {
+      type: "context",
+      elements: [
+        {
+          type: "mrkdwn",
+          text: "💡 *Tip:* Include specific error messages, feature area, and what the customer is trying to do for better matches.",
+        },
+      ],
+    },
+  ];
 }
 
 // ============================================================================
@@ -254,39 +354,74 @@ async function callAnthropic(
   }
 }
 
-async function llmSummarize(question: string, hits: Ranked[]): Promise<LlmSummary> {
+/**
+ * LLM summarize with support for no-context mode.
+ * @param question - The user's question
+ * @param hits - Ranked runbook hits (can be empty)
+ * @param noContextReason - If provided, tells LLM there's no runbook context
+ */
+async function llmSummarize(
+  question: string,
+  hits: Ranked[],
+  noContextReason?: string,
+): Promise<LlmSummary> {
+  const hasContext = hits.length > 0 && !noContextReason;
+
   // Fallback if no API key
   if (!Deno.env.get("ANTHROPIC_API_KEY")) {
-    const fallbackSummary = hits.length > 0
-      ? `Check the "${hits[0].chunk.pageTitle}" runbook for steps to address this issue.`
-      : "I couldn't find a clear match. Review the runbook links below.";
-    return { summary: fallbackSummary, recommendation: "try_steps" };
+    if (hasContext) {
+      return {
+        summary: `Check the "${hits[0].chunk.pageTitle}" runbook for steps to address this issue.`,
+        recommendation: "try_steps",
+      };
+    }
+    return {
+      summary: noContextReason
+        ? `I couldn't search the runbooks (${noContextReason}). Please describe the issue in more detail or check with your team lead.`
+        : "I couldn't find a clear match. Please provide more details about the issue.",
+      recommendation: "file_ticket",
+    };
   }
 
   // Build context from top hits (max ~400 chars each)
-  const context = hits.slice(0, 3).map((h, i) => {
-    const excerpt = h.chunk.text.slice(0, 400).replaceAll("\n", " ");
-    return `[${i + 1}] Title: ${h.chunk.pageTitle} | Section: ${h.chunk.sectionTitle}\nExcerpt: ${excerpt}`;
-  }).join("\n\n");
+  let contextSection: string;
+  if (hasContext) {
+    contextSection = hits.slice(0, 3).map((h, i) => {
+      const excerpt = h.chunk.text.slice(0, 400).replaceAll("\n", " ");
+      return `[${i + 1}] Title: ${h.chunk.pageTitle} | Section: ${h.chunk.sectionTitle}\nExcerpt: ${excerpt}`;
+    }).join("\n\n");
+  } else {
+    contextSection = noContextReason
+      ? `NO RUNBOOK CONTEXT AVAILABLE. Reason: ${noContextReason}`
+      : "NO RUNBOOK MATCHES FOUND for this query.";
+  }
 
-  const systemPrompt = `You are a CS support assistant. Based on runbook excerpts, provide a brief summary and recommendation.
+  const systemPrompt = `You are a CS support assistant. Based on runbook excerpts (if available), provide a brief summary and recommendation.
 Respond ONLY with valid JSON in this exact format:
 {"summary": "...", "recommendation": "try_steps" or "file_ticket"}
 
 Rules:
-- summary: 1-3 sentences summarizing what the runbook says to do. Max 600 chars.
-- recommendation: "try_steps" if the runbook has actionable CS steps, "file_ticket" if it requires engineering.
+- summary: 1-3 sentences summarizing what to do. Max 600 chars.
+- If runbook context is available: summarize the steps from the runbook.
+- If NO runbook context: acknowledge this and suggest next steps (gather info, escalate, etc.)
+- recommendation: "try_steps" if there are actionable CS steps, "file_ticket" if it needs engineering or no steps are clear.
 - Keep it concise and actionable.
 - Do not reveal internal systems, secrets, or code snippets.`;
 
-  const userMessage = `User question: ${question}\n\nRunbook excerpts:\n${context}`;
+  const userMessage = `User question: ${question}\n\nRunbook context:\n${contextSection}`;
 
   const raw = await callAnthropic(systemPrompt, userMessage);
   if (!raw) {
     // Fallback on API failure
+    if (hasContext) {
+      return {
+        summary: `Refer to "${hits[0]?.chunk.pageTitle || "runbook"}" for guidance.`,
+        recommendation: "try_steps",
+      };
+    }
     return {
-      summary: `Refer to "${hits[0]?.chunk.pageTitle || "runbook"}" for guidance.`,
-      recommendation: "try_steps",
+      summary: "Unable to generate summary. Please describe the issue in detail for manual review.",
+      recommendation: "file_ticket",
     };
   }
 
@@ -300,52 +435,9 @@ Rules:
     return { summary, recommendation: rec };
   }
 
-  // Parse failed - use raw as summary with fallback rec
+  // Parse failed - extract summary from raw text
   const truncated = raw.length > 600 ? raw.slice(0, 597) + "..." : raw;
-  return { summary: truncated, recommendation: "try_steps" };
-}
-
-const STATIC_CAPABILITIES = `*CS Helper — what I can do*
-
-I search our Notion CS runbooks and help you find the right steps for customer issues.
-
-• Find runbook steps for common CS issues
-• Tell you what info to collect before escalating
-• Suggest whether to file an engineering ticket
-• Show possible duplicate tickets in Linear
-• Link directly to source runbooks
-
-*Try asking like this*
-• \`/cs-help finalize pending\`
-• \`/cs-help analysis stuck pending\`
-• \`/cs-help ModelPrepSyncError after adding a segment\`
-
-Tip: Include specific error messages or symptoms for better matches.`;
-
-async function llmCapabilities(): Promise<string> {
-  // Fallback if no API key
-  if (!Deno.env.get("ANTHROPIC_API_KEY")) {
-    return STATIC_CAPABILITIES;
-  }
-
-  const systemPrompt = `You are a CS support bot that searches internal runbooks for customer support teams.
-Generate a short, Slack-friendly capabilities message. Use Slack mrkdwn formatting (*bold*, bullet points with •).
-
-Requirements:
-- Start with a brief intro line
-- List 5-8 bullet points of what you can do
-- Keep it under 400 characters total
-- Be accurate: you CAN search runbooks, find steps, suggest ticket filing, show duplicates, link sources
-- Do NOT claim you can: fix production, deploy code, access private systems, execute scripts, modify databases
-- Do NOT mention internal secrets or system names
-- End with a usage tip`;
-
-  const raw = await callAnthropic(systemPrompt, "Generate your capabilities message.", 400);
-  if (!raw) {
-    return STATIC_CAPABILITIES;
-  }
-
-  return raw;
+  return { summary: truncated, recommendation: hasContext ? "try_steps" : "file_ticket" };
 }
 
 // ============================================================================
@@ -588,27 +680,25 @@ function buildTicketDescription(args: {
   ].join("\n");
 }
 
-// Build Slack blocks for capabilities response
-function buildCapabilitiesBlocks(capabilitiesText: string): any[] {
-  return [
-    { type: "section", text: { type: "mrkdwn", text: capabilitiesText } },
-  ];
-}
-
 // Build Slack blocks for no_relevant response
 function buildNoRelevantBlocks(args: {
   question: string;
   requiredInfo: string[];
+  llmSummary?: string;
   actionId?: string;
 }): any[] {
   const reqInfoText = args.requiredInfo.slice(0, 6).map((x) => `• ${x}`).join("\n");
+
+  const summaryText = args.llmSummary
+    ? `*Summary*\n${args.llmSummary}\n\n`
+    : "";
 
   const blocks: any[] = [
     {
       type: "section",
       text: {
         type: "mrkdwn",
-        text: "*No strong runbook match found*\n\nI couldn't find a relevant runbook page for your question. This might be a new issue type or require more specific details.",
+        text: `*No strong runbook match found*\n\n${summaryText}I couldn't find a relevant runbook page for your question. This might be a new issue type or require more specific details.`,
       },
     },
     {
@@ -755,34 +845,79 @@ function buildRunbookBlocks(args: {
 }
 
 // ============================================================================
-// Main Orchestration: answerQuestion
+// Main Orchestration: handleQuestion
 // ============================================================================
 
-async function answerQuestion(
+const RELEVANCE_SCORE_THRESHOLD = 2;
+
+/**
+ * Unified question handler used by both web and Slack endpoints.
+ * Director runs FIRST, then RAG/index only if needed.
+ */
+async function handleQuestion(
   question: string,
   slackUser?: string,
   slackChannel?: string,
   opts: AnswerOpts = {},
-): Promise<{ blocks: any[]; isHelp: boolean; decision: DirectorDecision; llm?: LlmSummary }> {
-  // IMPORTANT: never crawl Notion here. If index isn't ready, fail fast.
-  const { chunks } = await buildIndex(false, { allowNotion: false });
+): Promise<AnswerResult> {
+  // STEP 1: Run director BEFORE any RAG/index work
+  const routeDecision = await director(question);
 
-  // Run director to determine response type
-  const decision = await director(question, chunks);
-
-  // A) Capabilities query
-  if (decision.kind === "capabilities") {
-    const capText = await llmCapabilities();
+  // STEP 2: If help route, return help immediately (NO RAG, NO index loading)
+  if (routeDecision.route === "help") {
     return {
-      blocks: buildCapabilitiesBlocks(capText),
-      isHelp: true,
-      decision,
+      blocks: buildHelpBlocks(),
+      route: routeDecision,
+      hits: [],
+      ragUsed: false,
     };
   }
 
-  // B) No relevant runbook content
-  if (decision.kind === "no_relevant") {
+  // STEP 3: Try to load index for RAG
+  let chunks: Chunk[] = [];
+  let indexAvailable = false;
+  let noContextReason: string | undefined;
+
+  try {
+    // IMPORTANT: never crawl Notion here. If index isn't ready, degrade gracefully.
+    const result = await buildIndex(false, { allowNotion: false });
+    chunks = result.chunks;
+    indexAvailable = chunks.length > 0;
+  } catch (e) {
+    // Index not available - degrade gracefully
+    noContextReason = "runbook index not available";
+    console.warn("Index not available:", String((e as any)?.message || e));
+  }
+
+  // STEP 4: If no index, update route decision
+  let finalRoute: RouteDecision = routeDecision;
+  if (!indexAvailable) {
+    finalRoute = { route: "answer", doRag: false, reason: noContextReason || "index empty" };
+  }
+
+  // STEP 5: Rank runbook hits (if index available)
+  const hits = indexAvailable ? rank(question, chunks, 5) : [];
+  const ragUsed = hits.length > 0 && hits[0].score >= RELEVANCE_SCORE_THRESHOLD;
+
+  // Update route if no relevant hits
+  if (indexAvailable && !ragUsed) {
+    if (hits.length === 0) {
+      finalRoute = { route: "answer", doRag: false, reason: "no runbook matches" };
+    } else {
+      finalRoute = { route: "answer", doRag: false, reason: `top score ${hits[0].score} below threshold ${RELEVANCE_SCORE_THRESHOLD}` };
+    }
+  }
+
+  // STEP 6A: No relevant runbook content
+  if (!ragUsed) {
     const requiredInfo = requiredInfoList(question);
+
+    // Get LLM summary (handles no-context mode)
+    const llmResult = await llmSummarize(
+      question,
+      [],
+      (finalRoute as any).reason || "no matches",
+    );
 
     // Still create an action payload for ticket filing
     const ticketTitle = `[CS] ${question.slice(0, 90)}${question.length > 90 ? "…" : ""}`;
@@ -799,15 +934,20 @@ async function answerQuestion(
     });
 
     return {
-      blocks: buildNoRelevantBlocks({ question, requiredInfo, actionId }),
-      isHelp: false,
-      decision,
-      llm: { summary: "No relevant runbook found.", recommendation: "file_ticket" },
+      blocks: buildNoRelevantBlocks({
+        question,
+        requiredInfo,
+        llmSummary: llmResult.summary,
+        actionId,
+      }),
+      route: finalRoute,
+      llm: llmResult,
+      hits: [],
+      ragUsed: false,
     };
   }
 
-  // C) Runbook response
-  const hits = decision.hits;
+  // STEP 6B: Runbook response with RAG
   const hitChunks = hits.map((h) => h.chunk);
 
   // Run the classifier on the relevant chunks
@@ -879,7 +1019,13 @@ async function answerQuestion(
     actionId,
   });
 
-  return { blocks, isHelp: false, decision, llm: llmResult };
+  return {
+    blocks,
+    route: { route: "answer", doRag: true },
+    llm: llmResult,
+    hits,
+    ragUsed: true,
+  };
 }
 
 // ============================================================================
@@ -1071,20 +1217,63 @@ const LLM_SEARCH_TIMEOUT_MS = 12000; // 12s timeout for LLM calls in /search
 
 async function handleSearch(url: URL): Promise<Response> {
   const q = url.searchParams.get("q") || "";
-  const useLLM = url.searchParams.get("llm") === "1";
 
-  // Get chunks without crawling Notion
-  const { chunks, stale, blobAgeMs } = await buildIndex(false, { allowNotion: false });
+  // STEP 1: Run director BEFORE any RAG/index work
+  const routeDecision = await director(q);
 
-  // Run director
-  const decision = await director(q, chunks);
+  // STEP 2: If help route, return help immediately (NO RAG, NO index loading)
+  if (routeDecision.route === "help") {
+    return json({
+      q,
+      route: "help",
+      rag_used: false,
+      help_text: buildHelpText(),
+      examples: [
+        "analysis is stuck in pending state",
+        "finalize not showing up for test",
+        "how do I reanalyze a test?",
+        "what info do I need for a stuck analysis?",
+      ],
+    });
+  }
 
-  // Build response based on director decision
+  // STEP 3: Try to get chunks (don't throw if unavailable)
+  let chunks: Chunk[] = [];
+  let stale: boolean | undefined;
+  let blobAgeMs: number | undefined;
+  let noContextReason: string | undefined;
+
+  try {
+    const result = await buildIndex(false, { allowNotion: false });
+    chunks = result.chunks;
+    stale = result.stale;
+    blobAgeMs = result.blobAgeMs;
+  } catch (e) {
+    noContextReason = "runbook index not available";
+    console.warn("Index not available for /search:", String((e as any)?.message || e));
+  }
+
+  // STEP 4: Rank hits (if index available)
+  const hits = chunks.length > 0 ? rank(q, chunks, 5) : [];
+  const ragUsed = hits.length > 0 && hits[0].score >= RELEVANCE_SCORE_THRESHOLD;
+
+  // Determine actual no-context reason
+  if (!noContextReason && !ragUsed) {
+    if (hits.length === 0) {
+      noContextReason = "no runbook matches";
+    } else {
+      noContextReason = `top score ${hits[0].score} below threshold ${RELEVANCE_SCORE_THRESHOLD}`;
+    }
+  }
+
+  // Build response
   const response: any = {
     q,
-    director: { kind: decision.kind, reason: decision.reason },
-    hits: decision.hits.map((h) => ({
+    route: "answer",
+    rag_used: ragUsed,
+    hits: hits.map((h) => ({
       title: h.chunk.pageTitle,
+      section: h.chunk.sectionTitle,
       url: h.chunk.url,
       score: h.score,
     })),
@@ -1098,55 +1287,26 @@ async function handleSearch(url: URL): Promise<Response> {
     response.cache_age_sec = Math.floor(blobAgeMs / 1000);
   }
 
-  if (decision.kind === "capabilities") {
-    // Return capabilities text, don't rank runbooks
-    // Only call LLM if llm=1 is set
-    if (useLLM) {
-      try {
-        const capText = await withTimeout(
-          llmCapabilities(),
-          LLM_SEARCH_TIMEOUT_MS,
-          "llmCapabilities",
-        );
-        response.capabilities = capText;
-      } catch (e) {
-        response.capabilities = STATIC_CAPABILITIES;
-        response.llm_error = String((e as any)?.message || e);
-      }
-    } else {
-      response.capabilities = STATIC_CAPABILITIES;
-    }
-  } else if (decision.kind === "runbook") {
-    // Only include LLM summary if llm=1 is set
-    if (useLLM) {
-      try {
-        const llmResult = await withTimeout(
-          llmSummarize(q, decision.hits),
-          LLM_SEARCH_TIMEOUT_MS,
-          "llmSummarize",
-        );
-        response.llm = {
-          summary: llmResult.summary,
-          recommendation: llmResult.recommendation,
-        };
-      } catch (e) {
-        // Fallback on timeout/error
-        response.llm = {
-          summary: `Refer to "${decision.hits[0]?.chunk.pageTitle || "runbook"}" for guidance.`,
-          recommendation: "try_steps",
-        };
-        response.llm_error = String((e as any)?.message || e);
-      }
-    }
-    // If llm=0 (default), no llm field in response
-  } else if (decision.kind === "no_relevant") {
-    // Short no-relevant summary (no LLM needed)
-    if (useLLM) {
-      response.llm = {
-        summary: "No relevant runbook content found for this query.",
-        recommendation: "file_ticket",
-      };
-    }
+  // Always include LLM summary for /search
+  try {
+    const llmResult = await withTimeout(
+      llmSummarize(q, ragUsed ? hits : [], noContextReason),
+      LLM_SEARCH_TIMEOUT_MS,
+      "llmSummarize",
+    );
+    response.llm = {
+      summary: llmResult.summary,
+      recommendation: llmResult.recommendation,
+    };
+  } catch (e) {
+    // Fallback on timeout/error
+    response.llm = {
+      summary: ragUsed
+        ? `Refer to "${hits[0]?.chunk.pageTitle || "runbook"}" for guidance.`
+        : "Unable to generate summary. Please provide more details.",
+      recommendation: ragUsed ? "try_steps" : "file_ticket",
+    };
+    response.llm_error = String((e as any)?.message || e);
   }
 
   return json(response);
@@ -1192,6 +1352,24 @@ async function handleSlackCommand(
   const channel_id = form.get("channel_id") || "";
   const channel_name = form.get("channel_name") || "unknown";
 
+  // STEP 1: Run director BEFORE any RAG/index work
+  const routeDecision = await director(question);
+
+  // STEP 2: If help route, respond ephemeral only (no parent post, no RAG)
+  if (routeDecision.route === "help") {
+    return new Response(
+      JSON.stringify({
+        response_type: "ephemeral",
+        blocks: buildHelpBlocks(),
+      }),
+      {
+        status: 200,
+        headers: { "content-type": "application/json; charset=utf-8" },
+      },
+    );
+  }
+
+  // STEP 3: For answer routes, ACK and process in background
   const ack = new Response(
     JSON.stringify({
       response_type: "ephemeral",
@@ -1211,11 +1389,11 @@ async function handleSlackCommand(
 
       const parent = await slackApi("chat.postMessage", {
         channel: channel_id,
-        text: `🧭 CS Helper request from @${user_name}: *${question || "help"}*`,
+        text: `🧭 CS Helper request from @${user_name}: *${question}*`,
       });
       const thread_ts = parent.ts;
 
-      const result = await answerQuestion(question, user_name, channel_name, {
+      const result = await handleQuestion(question, user_name, channel_name, {
         includeLinear: false,
       });
 
@@ -1263,8 +1441,28 @@ async function handleSlackEvents(
   const user = ev.user || "unknown";
   const question = String(ev.text || "").replace(/<@[^>]+>/g, "").trim();
 
+  // STEP 1: Run director BEFORE any RAG/index work
+  const routeDecision = await director(question);
+
+  // STEP 2: If help route, reply with help blocks only (no RAG)
+  if (routeDecision.route === "help") {
+    try {
+      await slackApi("chat.postMessage", {
+        channel,
+        thread_ts,
+        text: "CS Helper — what I can do",
+        blocks: buildHelpBlocks(),
+      });
+      return json({ ok: true });
+    } catch (e) {
+      console.error("Help response error:", e);
+      return json({ ok: true, error: String((e as any)?.message || e) });
+    }
+  }
+
+  // STEP 3: For answer routes, process with RAG
   try {
-    const result = await answerQuestion(question, user, channel, {
+    const result = await handleQuestion(question, user, channel, {
       includeLinear: true,
       linearTimeoutMs: 1200,
     });
@@ -1333,7 +1531,7 @@ export default async function handler(req: Request): Promise<Response> {
         const cache = getCache();
         const age = cache ? Math.floor((Date.now() - cache.builtAtMs) / 1000) : "n/a";
         return text(
-          `OK\nchunks=${chunks.length}\ncache_age_sec=${age}\nsource=${source}\nblobKey=${BLOB_KEY}\n\nTry: /search?q=finalize pending\nTry: /classify?q=finalize pending&llm=1\nTry: /debug\nTry: /rebuild\n`,
+          `OK\nchunks=${chunks.length}\ncache_age_sec=${age}\nsource=${source}\nblobKey=${BLOB_KEY}\n\nTry: /search?q=finalize pending\nTry: /search?q=what can you do\nTry: /classify?q=finalize pending&llm=1\nTry: /debug\nTry: /rebuild\n`,
         );
       } catch {
         return text(`Index not ready.\nRun: /rebuild\n`, 200);
