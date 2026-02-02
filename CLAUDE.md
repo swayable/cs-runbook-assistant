@@ -91,10 +91,20 @@ Engineer signals ALWAYS win over CS signals (conservative by default).
   "summary": "2-5 sentences",
   "recommendation": "try_steps | file_ticket",
   "next_actions": ["action 1", "action 2", ...],
-  "docs": [{"title", "url", "score", "provenance"}],
-  "related_tickets": [{"identifier", "title", "reason"}]
+  "hits": [{"pageTitle", "sectionTitle", "url", "score", "snippet", "codeSignals"}],
+  "embedded_ticket_urls": ["https://linear.app/..."],
+  "related_tickets": [{"identifier", "title", "url", "state", "reason"}],
+  "search_source": "notion_direct | blob_index | both | none",
+  "ticket_meta": {"source": "llm | keyword | none", "fetched": N, "team": "ENG"},
+  "latency_ms": 1234
 }
 ```
+
+Query params:
+- `q=...` - Search query (required)
+- `includeLinear=0` - Disable Linear ticket search (default: enabled)
+- `summarize=0` - Disable LLM summary (default: enabled)
+- `debug=1` - Include debug info (tokens, index status, threshold)
 
 ## Environment Variables
 
@@ -111,3 +121,17 @@ Engineer signals ALWAYS win over CS signals (conservative by default).
 | `OPENAI_API_KEY` | No | - | Embedding search (optional) |
 | `HYBRID_SEARCH_ENABLED` | No | `1` | Enable hybrid search |
 | `LLM_TICKET_MODEL` | No | `claude-3-5-haiku-20241022` | Ticket selection model |
+| `LINEAR_TIMEOUT_MS` | No | `5000` | Linear API timeout in ms |
+
+## Slack Bot Scopes
+
+Required Bot Token Scopes for full functionality:
+
+| Scope | Purpose |
+|-------|---------|
+| `app_mentions:read` | Receive @mentions |
+| `chat:write` | Post messages and responses |
+| `channels:history` | Fetch thread messages for context (optional, degrades gracefully) |
+| `commands` | Handle slash commands |
+
+**Note:** Without `channels:history`, thread context (Linear URLs from messages) won't be available. The bot will still function but won't show "From Slack thread" ticket references.
