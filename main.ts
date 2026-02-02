@@ -44,6 +44,7 @@ import {
   selectHighlyRelevantIssues,
   getRelatedTicketsWithLLM,
   fetchRecentIssues,
+  debugLinearTeams,
   type LinearIssue,
   type LLMSelectedIssue,
 } from "./linear/api.ts";

@@ -74,6 +74,12 @@ export async function getLinearTeamIdByKey(teamKey: string): Promise<string> {
   return team.id;
 }
 
+export async function debugLinearTeams(): Promise<{ teams: Array<{ key: string; name: string; id: string }> }> {
+  const q = `query Teams { teams { nodes { id key name } } }`;
+  const data = await linearGraphQL(q, {}) as { teams: { nodes: { id: string; key: string; name: string }[] } };
+  return { teams: data.teams.nodes.map((t) => ({ key: t.key, name: t.name, id: t.id })) };
+}
+
 export async function getLabelIdByName(labelName: string): Promise<string | null> {
   const q = `query IssueLabels { issueLabels { nodes { id name } } }`;
   const data = await linearGraphQL(q, {}) as { issueLabels: { nodes: { id: string; name: string }[] } };
@@ -148,7 +154,7 @@ export async function fetchRecentIssues(teamId: string, daysBack = 7, maxIssues 
   const sinceISO = since.toISOString();
 
   const q = `
-    query RecentIssues($teamId: ID!, $since: DateTime!, $first: Int!) {
+    query RecentIssues($teamId: String!, $since: DateTimeOrDuration!, $first: Int!) {
       team(id: $teamId) {
         issues(
           first: $first,
