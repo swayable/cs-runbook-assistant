@@ -1082,13 +1082,18 @@ async function handleQuestion(
   }
 
   // STEP 6B: Runbook response with RAG
+  console.log(`[handleQuestion] STEP 6B: Starting RAG response build...`);
   const hitChunks = hits.map((h) => h.chunk);
 
   // Run the classifier on the relevant chunks
+  console.log(`[handleQuestion] Running classifier...`);
   const classifierResult = classify(question, hitChunks);
+  console.log(`[handleQuestion] Classifier done: ${classifierResult.verdict}`);
 
   // Optionally enhance with LLM (if API key available)
+  console.log(`[handleQuestion] Running enhanceWithLLM...`);
   const enhancedClassifier = await enhanceWithLLM(question, hitChunks, classifierResult);
+  console.log(`[handleQuestion] enhanceWithLLM done`);
 
   // Get LLM summary for the response
   console.log(`[handleQuestion] Starting llmSummarize...`);
