@@ -24,7 +24,7 @@ This document describes manual tests for verifying the CS Helper bot changes:
 
 ### Test 1: /search Basic Query
 ```bash
-curl "https://YOUR_VAL_URL/search?q=analysis+stuck+pending"
+curl "https://swayable--fd813c40fef411f088c442dde27851f2.web.val.run/search?q=analysis+stuck+pending"
 ```
 
 **Expected Response:**
@@ -67,7 +67,7 @@ curl "https://YOUR_VAL_URL/search?q=analysis+stuck+pending"
 
 ### Test 2: /search with No Matches
 ```bash
-curl "https://YOUR_VAL_URL/search?q=random+gibberish+xyz123"
+curl "https://swayable--fd813c40fef411f088c442dde27851f2.web.val.run/search?q=random+gibberish+xyz123"
 ```
 
 **Verify:**
@@ -78,7 +78,7 @@ curl "https://YOUR_VAL_URL/search?q=random+gibberish+xyz123"
 
 ### Test 3: /search Help Query
 ```bash
-curl "https://YOUR_VAL_URL/search?q=help"
+curl "https://swayable--fd813c40fef411f088c442dde27851f2.web.val.run/search?q=help"
 ```
 
 **Verify:**
@@ -88,7 +88,7 @@ curl "https://YOUR_VAL_URL/search?q=help"
 
 ### Test 4: /health Endpoint
 ```bash
-curl "https://YOUR_VAL_URL/health"
+curl "https://swayable--fd813c40fef411f088c442dde27851f2.web.val.run/health"
 ```
 
 **Verify:**
@@ -99,7 +99,7 @@ curl "https://YOUR_VAL_URL/health"
 ### Test 5: /search Works From Cold Start
 ```bash
 # Delete blob index first (optional - via /blob-debug)
-curl "https://YOUR_VAL_URL/search?q=finalize+blocked"
+curl "https://swayable--fd813c40fef411f088c442dde27851f2.web.val.run/search?q=finalize+blocked"
 ```
 
 **Verify:**
@@ -197,7 +197,7 @@ In Slack: `/cs-help how's the weather`
 
 ### Test 14: Related Tickets - LLM Selection
 ```bash
-curl "https://YOUR_VAL_URL/search?q=customer+survey+not+loading"
+curl "https://swayable--fd813c40fef411f088c442dde27851f2.web.val.run/search?q=customer+survey+not+loading"
 ```
 
 **Verify:**
@@ -211,7 +211,7 @@ curl "https://YOUR_VAL_URL/search?q=customer+survey+not+loading"
 
 ### Test 15: Empty Query
 ```bash
-curl "https://YOUR_VAL_URL/search?q="
+curl "https://swayable--fd813c40fef411f088c442dde27851f2.web.val.run/search?q="
 ```
 
 **Verify:**
@@ -220,7 +220,7 @@ curl "https://YOUR_VAL_URL/search?q="
 
 ### Test 16: Very Long Query
 ```bash
-curl "https://YOUR_VAL_URL/search?q=..." (500+ characters)
+curl "https://swayable--fd813c40fef411f088c442dde27851f2.web.val.run/search?q=..." (500+ characters)
 ```
 
 **Verify:**
